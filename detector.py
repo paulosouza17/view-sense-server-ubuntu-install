@@ -24,21 +24,39 @@ class CameraDetector(threading.Thread):
         self.conf_threshold = self.config.get('confidence_threshold', 0.5)
         self.target_classes = self.config.get('classes', [0]) # Default to person
         
+        logger.info(f"Initializing CameraDetector for {self.camera_id}...")
+        
         # Initialize YOLO
-        self.model = YOLO(self.model_name)
-        
+        try:
+            self.model = YOLO(self.model_name)
+            logger.info(f"YOLO model '{self.model_name}' loaded successfully.")
+        except Exception as e:
+            logger.critical(f"Failed to load YOLO model: {e}")
+            raise
+
         # Initialize Tracker
-        self.tracker = sv.ByteTrack(frame_rate=self.config.get('fps', 30))
-        
+        try:
+            # Explicitly checking compatibility if possible, or just init
+            fps = self.config.get('fps', 30)
+            self.tracker = sv.ByteTrack(frame_rate=fps)
+            logger.info(f"ByteTrack initialized with frame_rate={fps}")
+        except Exception as e:
+            logger.critical(f"Failed to initialize ByteTrack: {e}")
+            raise
+
         # Initialize Line Counters
         self.line_counters = []
-        for line_conf in self.config.get('counting_lines', []):
-            lc = LineCounter(
-                start_point=line_conf['start'],
-                end_point=line_conf['end'],
-                name=line_conf['name']
-            )
-            self.line_counters.append(lc)
+        try:
+            for line_conf in self.config.get('counting_lines', []):
+                lc = LineCounter(
+                    start_point=line_conf['start'],
+                    end_point=line_conf['end'],
+                    name=line_conf['name']
+                )
+                self.line_counters.append(lc)
+            logger.info(f"Initialized {len(self.line_counters)} line counters.")
+        except Exception as e:
+            logger.error(f"Error initializing line counters: {e}")
             
         self.roi_id = self.config.get('roi_id')
 
@@ -48,7 +66,7 @@ class CameraDetector(threading.Thread):
         self.last_frame = None
 
     def run(self):
-        logger.info(f"Starting detection loop for camera {self.camera_id}")
+        logger.info(f"Starting detection loop for camera {self.camera_id} source={self.source}")
         self.running = True
         
         while self.running:
@@ -59,13 +77,14 @@ class CameraDetector(threading.Thread):
                     time.sleep(5)
                     continue
                 
-                logger.info(f"Connected to stream: {self.source}")
+                logger.info(f"Successfully connected to stream: {self.source}")
                 
-                while self.running and cap.isOpened():
+                while self.running:
                     ret, frame = cap.read()
                     if not ret:
-                        logger.warning(f"Failed to read frame from {self.camera_id}. Reconnecting...")
+                        logger.warning(f"Failed to read frame from {self.camera_id} - Stream ended or connection lost.")
                         break
+
                     
                     self.frame_count += 1
                     self.fps_monitor.tick()

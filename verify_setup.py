@@ -9,19 +9,53 @@ try:
     import fastapi
     print("FastAPI imported.")
     import uvicorn
-    print(f"Uvicorn imported: {uvicorn.__version__}")
+    print(f"Uvicorn: {uvicorn.__version__}")
     import ultralytics
-    print(f"Ultralytics imported: {ultralytics.__version__}")
+    print(f"Ultralytics: {ultralytics.__version__}")
     import supervision
-    print(f"Supervision imported: {getattr(supervision, '__version__', 'unknown')}")
+    print(f"Supervision: {getattr(supervision, '__version__', 'unknown')}")
     import cv2
-    print(f"OpenCV imported: {cv2.__version__}")
+    print(f"OpenCV: {cv2.__version__}")
     import httpx
-    print(f"HTTPX imported: {httpx.__version__}")
+    print(f"HTTPX: {httpx.__version__}")
     import yaml
     print("PyYAML imported.")
     import numpy
-    print(f"Numpy imported: {numpy.__version__}")
+    print(f"Numpy: {numpy.__version__}")
+
+    print("\n[TEST] Testing object instantiation to ensure compatibility...")
+    
+    # Test YOLO init
+    print("  -> Testing ultralytics.YOLO()...")
+    from ultralytics import YOLO
+    try:
+        # Just init, don't load heavy weights if possible, but 'yolov8n.pt' is smallest
+        # We'll rely on it being present or downloaded.
+        yolo = YOLO('yolov8n.pt') 
+        print("     [OK] YOLO initialized.")
+    except Exception as e:
+        print(f"     [FAIL] YOLO init failed: {e}")
+        sys.exit(1)
+
+    # Test Supervision imports
+    print("  -> Testing supervision.Detections...")
+    try:
+        # This was the error before: 'module' object has no attribute 'Detections'
+        det = supervision.Detections.empty()
+        print("     [OK] supervision.Detections found.")
+    except AttributeError as e:
+        print(f"     [FAIL] supervision.Detections missing! Check version. Error: {e}")
+        sys.exit(1)
+
+    print("  -> Testing supervision.ByteTrack...")
+    try:
+        tracker = supervision.ByteTrack()
+        print("     [OK] supervision.ByteTrack initialized.")
+    except Exception as e:
+        print(f"     [FAIL] ByteTrack init failed: {e}")
+        sys.exit(1)
+        
+    print("\n[SUCCESS] Deep verification passed!")
 except ImportError as e:
     print(f"Import failed: {e}")
     # We expect some to fail if not installed in the user's current environment
