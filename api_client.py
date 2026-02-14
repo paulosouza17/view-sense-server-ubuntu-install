@@ -8,16 +8,23 @@ import httpx
 logger = logging.getLogger(__name__)
 
 class APIClient:
-    def __init__(self, api_url: str, api_key: str, batch_size: int = 20):
+    def __init__(self, api_url: str, api_key: str, anon_key: str = "", batch_size: int = 20):
         self.api_url = api_url
         self.api_key = api_key
+        self.anon_key = anon_key # Supabase anon key
         self.batch_size = batch_size
         self.queue: List[Dict[str, Any]] = []
+        
+        # Headers for Supabase Edge Functions
         self.headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-            "apikey": self.api_key
+            "x-api-key": self.api_key, # Custom Auth
+            "apikey": self.anon_key    # Supabase Gateway Auth
         }
+        
+        if not self.anon_key:
+            logger.warning("anon_key is missing! Supabase requests will likely fail with 401.")
+            
         self.client = httpx.AsyncClient(headers=self.headers, timeout=10.0)
 
     async def add_detection(self, detection: Dict[str, Any]):

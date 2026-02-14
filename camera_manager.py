@@ -23,9 +23,14 @@ class CameraManager:
         api_config = self.config['viewsense']
         # We need the event loop for the async API client
         loop = asyncio.get_event_loop()
+        
+        # New: Get anon_key for Supabase
+        anon_key = api_config.get('anon_key', '')
+        
         self.api_client = APIClient(
             api_url=api_config['api_url'],
             api_key=api_config['api_key'],
+            anon_key=anon_key,
             batch_size=api_config.get('batch_size', 20)
         )
         self.api_client.loop = loop # Inject loop for threadsafe calls
