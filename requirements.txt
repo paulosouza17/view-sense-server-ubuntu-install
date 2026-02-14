@@ -1,7 +1,7 @@
 fastapi>=0.104.0
 uvicorn>=0.24.0
 ultralytics>=8.1.0
-supervision>=0.18.0
+supervision==0.21.0
 opencv-python-headless>=4.9.0
 httpx>=0.26.0
 pyyaml>=6.0

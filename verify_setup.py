@@ -9,19 +9,19 @@ try:
     import fastapi
     print("FastAPI imported.")
     import uvicorn
-    print("Uvicorn imported.")
+    print(f"Uvicorn imported: {uvicorn.__version__}")
     import ultralytics
-    print("Ultralytics imported.")
+    print(f"Ultralytics imported: {ultralytics.__version__}")
     import supervision
-    print("Supervision imported.")
+    print(f"Supervision imported: {getattr(supervision, '__version__', 'unknown')}")
     import cv2
-    print("OpenCV imported.")
+    print(f"OpenCV imported: {cv2.__version__}")
     import httpx
-    print("HTTPX imported.")
+    print(f"HTTPX imported: {httpx.__version__}")
     import yaml
     print("PyYAML imported.")
     import numpy
-    print("Numpy imported.")
+    print(f"Numpy imported: {numpy.__version__}")
 except ImportError as e:
     print(f"Import failed: {e}")
     # We expect some to fail if not installed in the user's current environment
