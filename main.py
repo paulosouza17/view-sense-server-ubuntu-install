@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from contextlib import asynccontextmanager
 import logging
 import asyncio
+import time
 
 from camera_manager import CameraManager
 
@@ -61,6 +62,41 @@ async def get_metrics():
         "active_cameras": len(camera_manager.cameras),
         "total_detections_buffered": len(camera_manager.api_client.queue) if camera_manager.api_client else 0
     }
+
+from fastapi.responses import StreamingResponse
+import cv2
+
+def generate_mjpeg_stream(camera_id: str):
+    if camera_id not in camera_manager.cameras:
+        return
+    
+    detector = camera_manager.cameras[camera_id]
+    
+    while True:
+        frame = detector.get_latest_frame()
+        if frame is not None:
+            # Encode as JPEG
+            ret, buffer = cv2.imencode('.jpg', frame)
+            if ret:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+        
+        # Limit to reasonable FPS for streaming (e.g., 20)
+        time.sleep(0.05)
+
+@app.get("/video/{camera_id}")
+async def video_feed(camera_id: str):
+    """
+    Streams the processed video (MJPEG) for a specific camera.
+    Can be used in <img> tags: <img src="/video/cam_id">
+    """
+    if camera_id not in camera_manager.cameras:
+        raise HTTPException(status_code=404, detail="Camera not found")
+        
+    return StreamingResponse(
+        generate_mjpeg_stream(camera_id), 
+        media_type="multipart/x-mixed-replace;boundary=frame"
+    )
 
 @app.post("/cameras/{camera_id}/restart")
 async def restart_camera(camera_id: str, background_tasks: BackgroundTasks):

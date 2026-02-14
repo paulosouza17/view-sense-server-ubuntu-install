@@ -2,9 +2,11 @@ import time
 import logging
 import cv2
 import threading
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import supervision as sv
 from ultralytics import YOLO
+import numpy as np
+import asyncio
 
 from api_client import APIClient
 from tracker import Tracker
@@ -36,7 +38,6 @@ class CameraDetector(threading.Thread):
 
         # Initialize Tracker
         try:
-            # Explicitly checking compatibility if possible, or just init
             fps = self.config.get('fps', 30)
             self.tracker = sv.ByteTrack(frame_rate=fps)
             logger.info(f"ByteTrack initialized with frame_rate={fps}")
@@ -63,7 +64,16 @@ class CameraDetector(threading.Thread):
         # Telemetry
         self.fps_monitor = sv.FPSMonitor()
         self.frame_count = 0
-        self.last_frame = None
+        
+        # Stream Output
+        self.latest_frame: Optional[np.ndarray] = None
+        self.lock = threading.Lock()
+
+        # Annotators
+        self.box_annotator = sv.BoxAnnotator()
+        self.label_annotator = sv.LabelAnnotator()
+        self.trace_annotator = sv.TraceAnnotator()
+        self.line_zone_annotator = sv.LineZoneAnnotator()
 
     def run(self):
         logger.info(f"Starting detection loop for camera {self.camera_id} source={self.source}")
@@ -82,13 +92,18 @@ class CameraDetector(threading.Thread):
                 while self.running:
                     ret, frame = cap.read()
                     if not ret:
-                        logger.warning(f"Failed to read frame from {self.camera_id} - Stream ended or connection lost.")
-                        break
-
+                        # Simulation Loop Logic:
+                        # If reading fails, it might be end of file (for MP4s).
+                        # Try to seek to beginning.
+                        logger.info(f"Stream ended for {self.camera_id}. Attempting to loop...")
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, frame = cap.read()
+                        if not ret:
+                            logger.warning("Failed to loop video. Reconnecting stream...")
+                            break
                     
                     self.frame_count += 1
                     self.fps_monitor.tick()
-                    self.last_frame = frame
                     
                     # Inference
                     results = self.model(frame, verbose=False, conf=self.conf_threshold)[0]
@@ -103,28 +118,46 @@ class CameraDetector(threading.Thread):
                     # Update Tracker
                     detections = self.tracker.update_with_detections(detections)
                     
+                    # Annotation Preparation
+                    annotated_frame = frame.copy()
+                    
+                    # Draw Traces
+                    annotated_frame = self.trace_annotator.annotate(
+                        scene=annotated_frame, detections=detections
+                    )
+                    
+                    # Draw Boxes
+                    annotated_frame = self.box_annotator.annotate(
+                        scene=annotated_frame, detections=detections
+                    )
+
+                    # Draw Labels
+                    labels = [
+                        f"#{tracker_id} {self.model.names[class_id]} {confidence:0.2f}"
+                        for tracker_id, class_id, confidence
+                        in zip(detections.tracker_id, detections.class_id, detections.confidence)
+                    ]
+                    annotated_frame = self.label_annotator.annotate(
+                        scene=annotated_frame, detections=detections, labels=labels
+                    )
+
                     # Check Lines
                     events = []
                     for lc in self.line_counters:
                         line_events = lc.trigger(detections)
                         events.extend(line_events)
+                        # Draw Line
+                        self.line_zone_annotator.annotate(annotated_frame, line_counter=lc.line_zone)
                     
-                    # Process Detections & Events
-                    # We can send all detections or only those that crossed.
-                    # The prompt implies: "Cada detecção que CRUZA a linha deve ter crossed_line=true..."
-                    # But also "Envia detecções para a API REST".
-                    # Usually we send periodic updates of all tracks OR only events.
-                    # Prompt says: "Envia detecções para a API... Payload conforme doc... crossed_line=true"
-                    # It seems we might want to send ALL active tracks, marking those that crossed.
-                    
-                    # Let's collect all current tracks
+                    # Update Shared Frame safely
+                    with self.lock:
+                        self.latest_frame = annotated_frame
+
+                    # Process Detections & Events for API
                     if detections.tracker_id is not None:
                         count_crossed = 0
                         
                         for i, track_id in enumerate(detections.tracker_id):
-                            # Check if this track crossed any line in this frame
-                            # The 'events' list contains dicts with track_id as STRING
-                            
                             crossing_info = next((e for e in events if str(e['track_id']) == str(track_id)), None)
                             
                             detection_payload = {
@@ -148,32 +181,13 @@ class CameraDetector(threading.Thread):
                                     "direction": crossing_info['direction']
                                 })
                                 count_crossed += 1
-                                # Priority send? 
-                                # We add to api client buffer
                             
-                            # Decision: Do we send ALL detections every frame? 
-                            # Or only crossed? 
-                            # prompt says "Counts line crossings... Sends detections". 
-                            # "Envio para API ... Acumular detecções em buffer"
-                            # If we send 30fps * objects, it's a lot. 
-                            # Usually we sample, or send events.
-                            # Prompt "Batch size 20" and "send_interval_seconds 2". 
-                            # If we send every frame, we act very fast. 
-                            # I will send ALL detections that are tracked, but the API client handles batching.
-                            # To save bandwidth/resources, maybe we only send if crossed_line or every N frames?
-                            # Prompt "Detecta pessoas... Rastreia... Conta... Envia". 
-                            # Let's Assume we send all tracked objects to visualization.
-                            
-                            # Optimization: only send if crossed OR if 1 second passed for this track?
-                            # For now, simply send everything to the buffer.
-                            # Exception: If multiple detections, this fills up fast. 
-                            # Let's stick to sending all tracked objects.
-                            
-                            # Using asyncio.run_coroutine_threadsafe to add to async queue from this thread
-                            asyncio.run_coroutine_threadsafe(
-                                self.api_client.add_detection(detection_payload),
-                                self.api_client.loop
-                            )
+                            # Send to API Client
+                            if self.api_client:
+                                asyncio.run_coroutine_threadsafe(
+                                    self.api_client.add_detection(detection_payload),
+                                    self.api_client.loop
+                                )
 
                 cap.release()
                 
@@ -183,7 +197,14 @@ class CameraDetector(threading.Thread):
     
     def stop(self):
         self.running = False
-        self.join()
+        # Do not join explicitly if called from signal handler to avoid deadlock, 
+        # but here it's fine.
+    
+    def get_latest_frame(self):
+        with self.lock:
+            if self.latest_frame is None:
+                return None
+            return self.latest_frame.copy()
 
     def get_status(self):
          return {
@@ -192,6 +213,3 @@ class CameraDetector(threading.Thread):
              "frames_processed": self.frame_count,
              "status": "running" if self.running else "stopped"
          }
-
-import numpy as np
-import asyncio
