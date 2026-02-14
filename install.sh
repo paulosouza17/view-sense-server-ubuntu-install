@@ -19,14 +19,20 @@ fi
 APP_DIR=$(pwd)
 USER_NAME=${SUDO_USER:-$USER}
 
-echo -e "${GREEN}Installing System Dependencies...${NC}"
+echo -e "${GREEN}Updating Package Lists...${NC}"
 apt update
-apt install -y python3.11 python3.11-venv python3-pip python3.11-dev build-essential libgl1-mesa-glx git
+
+echo -e "${GREEN}Installing System Dependencies...${NC}"
+# Ubuntu 24.04 (Noble) compatibility fixes:
+# - python3.11 might not be available, python3 (3.12) is default
+# - libgl1-mesa-glx is deprecated, use libgl1
+apt install -y python3 python3-venv python3-pip python3-dev build-essential libgl1 git
 
 # Create Virtual Environment
 echo -e "${GREEN}Setting up Python Virtual Environment...${NC}"
 if [ ! -d "venv" ]; then
-    python3.11 -m venv venv
+    # Use generic python3 command which points to the system's latest (3.12 on Noble)
+    python3 -m venv venv
     chown -R $USER_NAME:$USER_NAME venv
     echo "Virtual environment created."
 else
@@ -38,6 +44,7 @@ echo -e "${GREEN}Installing Python Requirements...${NC}"
 source venv/bin/activate
 pip install --upgrade pip
 if [ -f "requirements.txt" ]; then
+    # Install dependencies
     pip install -r requirements.txt
 else
     echo "requirements.txt not found!"
