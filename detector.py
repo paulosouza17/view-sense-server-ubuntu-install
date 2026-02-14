@@ -92,15 +92,21 @@ class CameraDetector(threading.Thread):
                 while self.running:
                     ret, frame = cap.read()
                     if not ret:
-                        # Simulation Loop Logic:
-                        # If reading fails, it might be end of file (for MP4s).
-                        # Try to seek to beginning.
-                        logger.info(f"Stream ended for {self.camera_id}. Attempting to loop...")
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        ret, frame = cap.read()
+                        # Stream ended or Connection Lost logic
+                        # If it's a file (mp4), we seek to 0.
+                        # If it's a stream (rtsp/hls), seeking usually doesn't work or throws error.
+                        
+                        is_local_file = isinstance(self.source, str) and not (self.source.startswith('http') or self.source.startswith('rtsp'))
+                        
+                        if is_local_file:
+                            logger.info(f"File end reached for {self.camera_id}. Looping...")
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            ret, frame = cap.read()
+                        
                         if not ret:
-                            logger.warning("Failed to loop video. Reconnecting stream...")
-                            break
+                            # If loop failed OR it is a stream (HLS/RTSP) that ended/broke
+                            logger.warning(f"Stream {self.camera_id} ended or failed. Reconnecting in 2s...")
+                            break # Break inner loop to re-initialize VideoCapture in outer loop
                     
                     self.frame_count += 1
                     self.fps_monitor.tick()
