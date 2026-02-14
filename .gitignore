@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+# Distribution / packaging
+.env
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+# Virtual Environment
+venv/
+env/
+ENV/
+# PyCharm
+.idea/
+# VS Code
+.vscode/
+# Local config (optional, if you want to keep your keys secret)
+# config.yaml (commented out as user might want the template committed, but usually keys shouldn't be)
+# Let's ignore a specific secrets file if we had one, but for now we'll keep config.yaml but warn user.
+# Docker
+.dockerignore

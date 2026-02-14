@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  yolo-server:
+    build: .
+    # runtime: nvidia  # Uncomment for NVIDIA GPU support
+    # environment:
+    #   - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ./config.yaml:/app/config.yaml
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
