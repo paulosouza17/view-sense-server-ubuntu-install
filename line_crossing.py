@@ -4,9 +4,12 @@ Módulo de detecção de cruzamento de linha.
 Usa o centróide inferior (bottom-center) do bounding box do tracker
 para determinar se um objeto cruzou uma linha de contagem.
 """
-import numpy as np
+import logging
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict
+
+# Configure Logger
+logger = logging.getLogger(__name__)
 
 @dataclass
 class CountingLine:
@@ -122,6 +125,14 @@ class LineCrossingDetector:
             
             current_side = line.side_of_point(point)
             
+            # DEBUG: Log Proximity (< 50 pixels from line)
+            # This helps user visualize where the "invisible line" is relative to people
+            if abs(current_side) < 50:
+                 # Rate limit logs? No, we need frame-by-frame here for diagnosis.
+                 # Using print/warning to ensure visibility if log level is high.
+                 pass 
+                 # logger.info(f"PROXIMITY: Track {track_id} dist={current_side:.1f} to line '{line.name}' at {point}")
+
             if key in self._track_sides:
                 prev_side = self._track_sides[key]
                 
@@ -129,14 +140,12 @@ class LineCrossingDetector:
                 if prev_side * current_side < 0:
                     # Determinar direção: 
                     # positivo→negativo = "in", negativo→positivo = "out"
-                    # Nota: Isso depende do sentido do vetor normal.
-                    # Se normal aponta para "fora", então positivo é fora e negativo é dentro.
-                    # Cruzar de + para - significa entrar (In).
                     
                     direction = "in" if prev_side > 0 else "out"
                     
                     # Filtrar por direção configurada na linha
                     if line.direction == "both" or line.direction == direction:
+                        logger.info(f"CROSSING DETECTED: {track_id} -> {direction} on line '{line.name}' ({line.roi_id})")
                         crossings.append({
                             "roi_id": line.roi_id,
                             "direction": direction,
@@ -144,18 +153,7 @@ class LineCrossingDetector:
                         })
                         self._counted[key] = direction
                     else:
-                        # Log ignora para debug
-                        pass # Logger is not available inside this class easily unless passed or global.
-                        # We will let it pass silently here to keep class pure, 
-                        # but in detector.py we capture the output.
-                        # Wait, we can't capture it if we don't return it.
-                        
-                        # Better strategy: Return it with "crossed_line": False or a flag?
-                        # No, that breaks contract.
-                        # Let's import logging here.
-                        import logging
-                        logger = logging.getLogger("line_crossing")
-                        logger.info(f"IGNORED CROSSING: {track_id} -> {direction} on line {line.name} (Config: {line.direction})")
+                        logger.warning(f"IGNORED CROSSING: {track_id} -> {direction} on line '{line.name}' (Config expects: {line.direction})")
             
             self._track_sides[key] = current_side
         
