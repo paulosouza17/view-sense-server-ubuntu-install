@@ -1,10 +1,10 @@
 viewsense:
   api_url: "https://dwtzkynjbcwrdqlnmktj.supabase.co/functions/v1/ingest-detections"
   api_key: "SUA_CHAVE_AQUI"
-  send_interval_seconds: 2
-  batch_size: 1
-  heartbeat_interval_seconds: 60
-  roi_sync_interval_seconds: 60
+  send_interval_seconds: 1200 # 20 Minutos (Economia máxima de requests)
+  batch_size: 500 # Acumula bastante antes de enviar (Menos invocação da Edge)
+  heartbeat_interval_seconds: 300 # Heartbeat a cada 5 min (menos ruído)
+  roi_sync_interval_seconds: 300 # Sync a cada 5 min
 
 cameras:
   - id: "uuid-da-camera-no-viewsense"

@@ -81,7 +81,28 @@ echo "Service file created at $SERVICE_FILE"
 # Enable and Start Service
 systemctl daemon-reload
 systemctl enable viewsense-yolo
-# We don't start it immediately to allow user to config
+
+# Create Systemd Path Unit for Auto-Restart on Config Change
+echo -e "${GREEN}Creating Systemd Path Unit (Config Watcher)...${NC}"
+PATH_UNIT_FILE="/etc/systemd/system/viewsense-yolo.path"
+
+cat > $PATH_UNIT_FILE <<EOF
+[Unit]
+Description=Monitor config.yaml for changes to restart ViewSense YOLO
+
+[Path]
+PathModified=$APP_DIR/config.yaml
+Unit=viewsense-yolo.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable viewsense-yolo.path
+systemctl start viewsense-yolo.path
+echo "✅ Auto-restart on config change enabled."
+
+# We don't start the main service immediately to allow user to config
 # systemctl start viewsense-yolo
 
 echo -e "${GREEN}Installation Complete!${NC}"
