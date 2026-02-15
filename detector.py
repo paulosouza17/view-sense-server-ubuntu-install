@@ -209,6 +209,68 @@ class CameraDetector(threading.Thread):
                 logger.error(f"Error in camera loop {self.camera_id}: {e}")
                 time.sleep(5)
     
+    def update_settings(self, rois: List[Dict[str, Any]], camera_config: Dict[str, Any]):
+        """
+        Updates camera settings (Counting Lines, Confidence, Classes) dynamically.
+        """
+        logger.info(f"Updating settings for camera {self.camera_id}")
+        
+        # 1. Update Detection Params
+        if camera_config:
+            new_conf = camera_config.get('confidence_threshold')
+            if new_conf:
+                self.conf_threshold = float(new_conf)
+            
+            new_classes = camera_config.get('enabled_classes')
+            if new_classes:
+                # Assuming classes come as list of strings "person", "car" or ints
+                # Model names is a dict {0: 'person', ...}
+                # We need to map strings to ints
+                target_ints = []
+                
+                # Invert model names map for lookup
+                name_to_id = {v: k for k, v in self.model.names.items()}
+                
+                for c in new_classes:
+                    if isinstance(c, int):
+                        target_ints.append(c)
+                    elif isinstance(c, str):
+                        if c in name_to_id:
+                            target_ints.append(name_to_id[c])
+                            
+                self.target_classes = target_ints
+                
+        # 2. Update Counting Lines
+        try:
+            new_counters = []
+            for roi in rois:
+                if roi.get('roi_type') == 'line' and roi.get('is_counting_line') and roi.get('is_active'):
+                    coords = roi.get('coordinates', [])
+                    if len(coords) >= 2:
+                        start = [coords[0]['x'], coords[0]['y']]
+                        end = [coords[1]['x'], coords[1]['y']]
+                        
+                        lc = LineCounter(
+                            start_point=start,
+                            end_point=end,
+                            name=roi.get('name', 'Line')
+                        )
+                        lc.roi_id = roi.get('id') # Store ROI UUID
+                        # Restore direction info if needed, or LineCounter handles it? 
+                        # LineCounter logic relies on vector math. 
+                        # Direction in ROI ('in'/'out') is logical.
+                        # We attach ROI metadata to be used in event payload.
+                        lc.direction_label = roi.get('direction', 'in')
+                        
+                        new_counters.append(lc)
+            
+            # Atomic swap
+            self.line_counters = new_counters
+            # logger.info(f"Updated {len(new_counters)} counting lines.")
+            
+        except Exception as e:
+            logger.error(f"Failed to update counting lines: {e}")
+
     def stop(self):
         self.running = False
         # Do not join explicitly if called from signal handler to avoid deadlock, 

@@ -143,26 +143,28 @@ class APIClient:
             await asyncio.sleep(interval)
             
     async def roi_sync_loop(self):
-        if not self.roi_sync_url:
-            return
+        # Deprecated: Handled by ROISyncManager now, but kept for compatibility logic if needed
+        # We will disable the internal loop in main in favor of ROISyncManager
+        pass
+
+    async def sync_rois(self) -> Optional[Dict[str, Any]]:
+        """Sincroniza ROIs do painel web via endpoint /roi-sync"""
+        if not self.roi_sync_url or not self.server_id:
+            logger.warning("ROI Sync skipped: roi_sync_url or server_id missing.")
+            return None
             
-        interval = self.config["viewsense"].get("roi_sync_interval_seconds", 60)
-        logger.info(f"Starting ROI sync loop (interval={interval}s)...")
-        while self.running:
-            try:
-                resp = await self.client.get(
-                    self.roi_sync_url,
-                    params={"server_id": self.server_id}
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    logger.info(f"ROI Sync: {len(data)} updates received.")
-                    # In a full implementation, we would update CameraManager config here
-                else:
-                    logger.warning(f"ROI Sync failed: {resp.status_code}")
-            except Exception as e:
-                logger.error(f"ROI Sync error: {e}")
-            await asyncio.sleep(interval)
+        try:
+            response = await self.client.get(
+                self.roi_sync_url,
+                params={"server_id": self.server_id}
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            # logger.error(f"Sync ROIs failed: {e}") 
+            # Log warning to avoid spamming error on transient network issues
+            logger.warning(f"Sync ROIs failed: {e}")
+            return {"error": str(e)}
 
     async def close(self):
         self.running = False
