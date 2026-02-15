@@ -33,12 +33,16 @@ async def lifespan(app: FastAPI):
     # but usually works. A better way:
     # We'll set the loop explicitly.
     
+    # We'll set the loop explicitly.
+    
     camera_manager.api_client_loop = loop 
-    # Wait, in camera_manager.py I did: `loop = asyncio.get_event_loop()`
-    # Let's trust that works or modify camera_manager if needed.
-    # But better is to just call start().
     
     camera_manager.start()
+    
+    # Start Observability Loops
+    if camera_manager.api_client:
+        asyncio.create_task(camera_manager.api_client.heartbeat_loop())
+        asyncio.create_task(camera_manager.api_client.roi_sync_loop())
     
     yield
     
