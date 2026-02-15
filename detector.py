@@ -54,21 +54,10 @@ class CameraDetector(threading.Thread):
         self.raw_rois: List[Dict] = []
         self.current_resolution: Optional[Tuple[int, int]] = None
         
+        # Line Counters are now managed by ROI Sync & Dynamic Resolution
+        # We skip local config reading here.
         self.roi_id = self.config.get('roi_id')
-        try:
-            for line_conf in self.config.get('counting_lines', []):
-                lc = LineCounter(
-                    start_point=line_conf['start'],
-                    end_point=line_conf['end'],
-                    name=line_conf['name']
-                )
-                self.line_counters.append(lc)
-            logger.info(f"Initialized {len(self.line_counters)} line counters.")
-        except Exception as e:
-            logger.error(f"Error initializing line counters: {e}")
-            
-        self.roi_id = self.config.get('roi_id')
-
+        
         # Telemetry
         self.fps_monitor = sv.FPSMonitor()
         self.frame_count = 0
