@@ -1,18 +1,13 @@
-import yaml
-import logging
-import asyncio
-from typing import Dict
-from api_client import APIClient
-from detector import CameraDetector
-
-logger = logging.getLogger(__name__)
+from roi_sync import ROISyncManager
 
 class CameraManager:
     def __init__(self, config_path: str = "config.yaml"):
+        # ... existing init ...
         self.config_path = config_path
         self.cameras: Dict[str, CameraDetector] = {}
         self.config = self._load_config()
         self.api_client = None
+        self.roi_manager = None # Store ROI Manager
 
     def _load_config(self):
         with open(self.config_path, 'r') as f:
@@ -20,9 +15,11 @@ class CameraManager:
 
     def start(self):
         # Initialize API Client
-        
-        # Pass full config to API Client so it can read all URLs
         self.api_client = APIClient(self.config)
+        
+        # Initialize ROI Sync Manager
+        self.roi_manager = ROISyncManager(self.api_client, self.config)
+        self.roi_manager.on_roi_change(self.on_roi_updated)
 
         # Start Camera Detectors
         for cam_conf in self.config['cameras']:
@@ -31,6 +28,19 @@ class CameraManager:
         # Update active camera count for heartbeat
         if self.api_client:
             self.api_client.active_cameras = len(self.cameras)
+            # Start ROI Sync Task
+            asyncio.create_task(self.roi_manager.start())
+
+    def on_roi_updated(self, camera_id: str, rois: list, camera_config: dict):
+        """Callback from ROISyncManager when ROIs change."""
+        if camera_id in self.cameras:
+            detector = self.cameras[camera_id]
+            detector.update_settings(rois, camera_config)
+            logger.info(f"Updated settings for camera {camera_id} via ROI Sync")
+        else:
+            # New camera? Logic to add it would go here if we support dynamic camera add.
+            # For now, we only update existing ones.
+            logger.warning(f"Received ROI update for unknown camera {camera_id}")
 
     def _start_camera(self, cam_conf):
         cam_id = cam_conf['id']
