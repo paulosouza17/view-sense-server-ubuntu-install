@@ -20,3 +20,10 @@ cameras:
         start: [100, 400]
         end: [600, 400]
         direction: "in_out"
+    # Dwell Time / Occupancy Zones
+    zones:
+      - id: "zone-frente-loja"
+        name: "Frente Loja"
+        # Polygon points [x, y]
+        points: [[100, 400], [600, 400], [600, 600], [100, 600]] 
+        min_dwell_time: 1.0 # Seconds

@@ -1,4 +1,4 @@
-
+    
 import time
 import logging
 import cv2
@@ -14,6 +14,8 @@ from api_client import APIClient
 from tracker import Tracker
 # from line_counter import LineCounter # Deprecated
 from line_crossing import LineCrossingDetector, CountingLine
+from zone_monitor import ZoneMonitor
+from face_analyzer import FaceAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,17 @@ class CameraDetector(threading.Thread):
         # Initialize Line Crossing Detector (New)
         self.crossing_detector = LineCrossingDetector()
         self.counting_lines: List[CountingLine] = []
+
+        # Initialize Zone Monitor (New)
+        self.zone_monitor: Optional[ZoneMonitor] = None
+        self.zones_config = self.config.get('zones', []) # List of zones from config
+
+        # Initialize Face Analyzer (New - Demographics)
+        self.face_analyzer = FaceAnalyzer()
+        # Cache for demographics: {track_id: {'age': ..., 'gender': ...}}
+        self.demographics_cache: Dict[str, Dict[str, Any]] = {}
+        # We can trigger model load in background to avoid stall on first frame
+        threading.Thread(target=self.face_analyzer.load_models, daemon=True).start()
         
         # State for dynamic resolution handling
         self.raw_rois: List[Dict] = []
@@ -145,6 +158,7 @@ class CameraDetector(threading.Thread):
                     if self.current_resolution != (width, height):
                         # Resolution changed or initial frame
                         self._rebuild_lines(width, height)
+                        self._rebuild_zones(width, height)
                     
                     # Inference
                     results = self.model(frame, verbose=False, conf=self.conf_threshold)[0]
@@ -198,6 +212,26 @@ class CameraDetector(threading.Thread):
                                 lines=self.counting_lines
                             )
                             
+                            # ANALYTICS: Demographics (Age/Gender)
+                            # Only for Person class (0) and if not already analyzed
+                            demographics = {}
+                            if int(detections.class_id[i]) == 0: # 0 is person in COCO
+                                if str_track_id in self.demographics_cache:
+                                    demographics = self.demographics_cache[str_track_id]
+                                else:
+                                    # Analyze new track
+                                    # We should only analyze if confidence is good and face likely visible
+                                    if detections.confidence[i] > 0.6: 
+                                        analysis = self.face_analyzer.detect_and_analyze(frame, bbox)
+                                        if analysis:
+                                            self.demographics_cache[str_track_id] = analysis
+                                            demographics = analysis
+                                            logger.info(f"Demographics for {str_track_id}: {analysis['age']}, {analysis['gender']}")
+
+                            # ANALYTICS: Dwell Time
+                            # Zone events are bulk processed, but we can also attach "current zone" info to payload if needed.
+                            # For now, Dwell Time events are sent SEPARATELY below.
+                            
                             # Prepare Payload
                             detection_payload = {
                                 "camera_id": self.camera_id,
@@ -208,7 +242,10 @@ class CameraDetector(threading.Thread):
                                 "bounding_box": bbox,
                                 "roi_id": None,
                                 "crossed_line": False,
-                                "direction": None
+                                "direction": None,
+                                "age": demographics.get("age"),
+                                "gender": demographics.get("gender"),
+                                "dwell_time": None # populated only for zone_exit events
                             }
                             
                             # If crossed, update payload
@@ -247,7 +284,44 @@ class CameraDetector(threading.Thread):
                                     future.add_done_callback(handle_future_result)
                                 except Exception as e:
                                     logger.error(f"Failed to schedule API call: {e}")
-                    
+
+                    # -------------------------------------------------------------
+                    # PROCESS ZONE EVENTS (Dwell Time)
+                    # -------------------------------------------------------------
+                    if self.zone_monitor:
+                        zone_events = self.zone_monitor.update(detections)
+                        for event in zone_events:
+                            # event: {type, zone_id, track_id, dwell_time, action}
+                            
+                            # Create a specialized payload for Dwell Event
+                            # Or reuse standard payload?
+                            # Let's create a standard payload marked as "dwell_event"
+                            
+                            # We need class/confidence? we might not have it easily for "exited" tracks
+                            # unless we cache it. For now, sending what we have.
+                            
+                            dwell_payload = {
+                                "camera_id": self.camera_id,
+                                "timestamp": datetime.utcnow().isoformat() + "Z",
+                                "track_id": event["track_id"],
+                                "roi_id": event["zone_id"], # Zone ID
+                                "event_type": "dwell",
+                                "dwell_time": event["dwell_time"],
+                                "action": event["action"], # "exit"
+                                # Enriched with cached demographics if available
+                                "age": self.demographics_cache.get(event["track_id"], {}).get("age"),
+                                "gender": self.demographics_cache.get(event["track_id"], {}).get("gender"),
+                            }
+                            
+                            if self.api_client:
+                                logger.info(f"DWELL EVENT: Track {event['track_id']} spent {event['dwell_time']}s in {event['zone_id']}")
+                                try:
+                                    asyncio.run_coroutine_threadsafe(
+                                        self.api_client.add_detection(dwell_payload),
+                                        self.api_client.loop
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Failed to emit dwell event: {e}")
                     # Cleanup stale tracks from crossing detector
                     self.crossing_detector.cleanup_stale_tracks(active_track_ids)
 
@@ -344,9 +418,43 @@ class CameraDetector(threading.Thread):
             return self.latest_frame.copy()
 
     def get_status(self):
-         return {
-             "id": self.camera_id,
-             "fps": self.fps_monitor.fps,
-             "frames_processed": self.frame_count,
-             "status": "running" if self.running else "stopped"
-         }
+        return {
+            "id": self.camera_id,
+            "fps": self.fps_monitor.fps,
+            "frames_processed": self.frame_count,
+            "running": self.running,
+            "resolution": self.current_resolution,
+            "active_lines": len(self.counting_lines),
+            "active_zones": len(self.zone_monitor.zones) if self.zone_monitor else 0
+        }
+
+    def _rebuild_zones(self, width: int, height: int):
+        """Re-initializes ZoneMonitor with current resolution."""
+        # Clean current monitor
+        self.zone_monitor = ZoneMonitor((width, height))
+        
+        for z_conf in self.zones_config:
+            # Config format: points: [[x,y], [x,y]...] (Normalized preferably, but user config might be pixels)
+            # Config example: points: [[100, 100], [200, 100], ...]
+            # Let's assume Pixel Coordinates if numbers > 1, else Normalized.
+            
+            raw_points = z_conf.get('points', [])
+            if not raw_points:
+                continue
+                
+            final_points = []
+            for p in raw_points:
+                x, y = p
+                # Check if normalized
+                if 0 <= x <= 1 and 0 <= y <= 1 and isinstance(x, float):
+                    final_points.append([int(x * width), int(y * height)])
+                else:
+                    final_points.append([int(x), int(y)])
+            
+            self.zone_monitor.add_zone(
+                pool_id=z_conf.get('id', 'unknown_zone'),
+                name=z_conf.get('name', 'Zone'),
+                polygon_points=final_points
+            )
+        
+        logger.info(f"Rebuilt {len(self.zone_monitor.zones)} zones for resolution {width}x{height}")
