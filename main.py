@@ -10,6 +10,9 @@ import os
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "timeout;10000" # 10s timeout
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import StreamingResponse
+import cv2
+import threading
 
 from camera_manager import CameraManager
 
@@ -60,11 +63,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="ViewSense YOLO Server", lifespan=lifespan)
 
 @app.get("/status")
-async def get_status():
-    return {
-        "cameras": camera_manager.get_all_status(),
-        "api_client_queue": len(camera_manager.api_client.queue) if camera_manager.api_client else 0
-    }
+async def status():
+    """Detailed status of all cameras."""
+    stats = []
+    for cam_id, detector in camera_manager.cameras.items():
+        stats.append(detector.get_status())
+    return {"cameras": stats}
 
 @app.get("/metrics")
 async def get_metrics():
@@ -74,8 +78,44 @@ async def get_metrics():
         "total_detections_buffered": len(camera_manager.api_client.queue) if camera_manager.api_client else 0
     }
 
-from fastapi.responses import StreamingResponse
-import cv2
+# --- MJPEG STREAMING LOGIC ---
+def gen_frames(camera_id: str):
+    """Generator for MJPEG stream."""
+    detector = camera_manager.cameras.get(camera_id)
+    if not detector:
+        return
+        
+    while True:
+        if not detector.running:
+            break
+            
+        # Get latest annotated frame
+        frame = detector.get_latest_frame()
+        
+        if frame is not None:
+            try:
+                # Encode to JPEG (CPU intensive step, only runs if client connected)
+                ret, buffer = cv2.imencode('.jpg', frame)
+                if ret:
+                    frame_bytes = buffer.tobytes()
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            except Exception as e:
+                logger.error(f"Error encoding frame for stream {camera_id}: {e}")
+                
+        # Control framerate to save bandwidth (max 10fps for debug)
+        time.sleep(0.1)
+
+@app.get("/video_feed/{camera_id}")
+async def video_feed(camera_id: str):
+    """Returns an MJPEG stream for the specified camera."""
+    if camera_id not in camera_manager.cameras:
+        raise HTTPException(status_code=404, detail="Camera not found")
+        
+    return StreamingResponse(
+        gen_frames(camera_id), 
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
 
 def generate_mjpeg_stream(camera_id: str):
     if camera_id not in camera_manager.cameras:
