@@ -5,6 +5,7 @@ Usa o centróide inferior (bottom-center) do bounding box do tracker
 para determinar se um objeto cruzou uma linha de contagem.
 """
 import logging
+import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict
 
