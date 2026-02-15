@@ -10,7 +10,8 @@ import asyncio
 
 from api_client import APIClient
 from tracker import Tracker
-from line_counter import LineCounter
+# from line_counter import LineCounter # Deprecated
+from line_crossing import LineCrossingDetector, CountingLine
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +46,16 @@ class CameraDetector(threading.Thread):
             logger.critical(f"Failed to initialize ByteTrack: {e}")
             raise
 
-        # Initialize Line Counters
-        self.line_counters = []
+        # Initialize Line Crossing Detector (New)
+        self.crossing_detector = LineCrossingDetector()
+        self.counting_lines: List[CountingLine] = []
+        
+        # We don't initialize lines here because we wait for ROI Sync.
+        # But if config has local counting_lines, we could load them?
+        # For uniformity, let's rely on ROI Sync to populate this.
+        # Or parse legacy counting_lines if needed.
+        
+        self.roi_id = self.config.get('roi_id')
         try:
             for line_conf in self.config.get('counting_lines', []):
                 lc = LineCounter(
@@ -132,69 +141,70 @@ class CameraDetector(threading.Thread):
                     # Update Tracker
                     detections = self.tracker.update_with_detections(detections)
                     
+                    # Track Active IDs for cleanup
+                    active_track_ids = set()
+                    
                     # Annotation Preparation
                     annotated_frame = frame.copy()
                     
+                    # ... (Annotation logic omitted for brevity if unchanged, but included below for context) ...
                     # Draw Traces
                     annotated_frame = self.trace_annotator.annotate(
                         scene=annotated_frame, detections=detections
                     )
-                    
                     # Draw Boxes
                     annotated_frame = self.box_annotator.annotate(
                         scene=annotated_frame, detections=detections
                     )
 
-                    # Draw Labels
-                    labels = [
-                        f"#{tracker_id} {self.model.names[class_id]} {confidence:0.2f}"
-                        for tracker_id, class_id, confidence
-                        in zip(detections.tracker_id, detections.class_id, detections.confidence)
-                    ]
-                    annotated_frame = self.label_annotator.annotate(
-                        scene=annotated_frame, detections=detections, labels=labels
-                    )
-
-                    # Check Lines
-                    events = []
-                    for lc in self.line_counters:
-                        line_events = lc.trigger(detections)
-                        events.extend(line_events)
-                        # Draw Line
-                        self.line_zone_annotator.annotate(annotated_frame, line_counter=lc.line_zone)
-                    
-                    # Update Shared Frame safely
-                    with self.lock:
-                        self.latest_frame = annotated_frame
-
                     # Process Detections & Events for API
                     if detections.tracker_id is not None:
-                        count_crossed = 0
                         
                         for i, track_id in enumerate(detections.tracker_id):
-                            crossing_info = next((e for e in events if str(e['track_id']) == str(track_id)), None)
+                            str_track_id = str(track_id)
+                            active_track_ids.add(str_track_id)
                             
+                            # Extract BBox
+                            x1, y1, x2, y2 = detections.xyxy[i]
+                            bbox = {
+                                "x": int(x1),
+                                "y": int(y1),
+                                "width": int(x2 - x1),
+                                "height": int(y2 - y1)
+                            }
+                            
+                            # Check Crossings
+                            crossings = self.crossing_detector.update(
+                                track_id=str_track_id,
+                                bbox=bbox,
+                                lines=self.counting_lines
+                            )
+                            
+                            # Prepare Payload
                             detection_payload = {
                                 "camera_id": self.camera_id,
                                 "detection_class": self.model.names[detections.class_id[i]],
                                 "confidence": float(detections.confidence[i]),
-                                "track_id": str(track_id),
-                                "bounding_box": {
-                                    "x": int(detections.xyxy[i][0]),
-                                    "y": int(detections.xyxy[i][1]),
-                                    "width": int(detections.xyxy[i][2] - detections.xyxy[i][0]),
-                                    "height": int(detections.xyxy[i][3] - detections.xyxy[i][1])
-                                },
-                                "roi_id": self.roi_id,
-                                "crossed_line": False
+                                "track_id": str_track_id,
+                                "bounding_box": bbox,
+                                "roi_id": None,
+                                "crossed_line": False,
+                                "direction": None
                             }
                             
-                            if crossing_info:
+                            # If crossed, update payload
+                            # Note: A single track might cross multiple lines in one frame (rare but possible).
+                            # API usually expects one event per object per frame.
+                            # We pick the first crossing event to report, or we need to send multiple.
+                            # Assuming 1 event for now.
+                            if crossings:
+                                crossing = crossings[0]
                                 detection_payload.update({
                                     "crossed_line": True,
-                                    "direction": crossing_info['direction']
+                                    "roi_id": crossing['roi_id'],
+                                    "direction": crossing['direction']
                                 })
-                                count_crossed += 1
+                                logger.info(f"CROSSING: {str_track_id} -> {crossing['direction']} on {crossing['roi_id']}")
                             
                             # Send to API Client
                             if self.api_client:
@@ -202,7 +212,31 @@ class CameraDetector(threading.Thread):
                                     self.api_client.add_detection(detection_payload),
                                     self.api_client.loop
                                 )
+                    
+                    # Cleanup stale tracks from crossing detector
+                    self.crossing_detector.cleanup_stale_tracks(active_track_ids)
 
+                    # Draw Lines (Visual Aid)
+                    # We can use LineZoneAnnotator for visualization if we map CountingLine back to LineZone
+                    # Or just draw lines manually using cv2
+                    for line in self.counting_lines:
+                         cv2.line(annotated_frame, 
+                                  (int(line.p1[0]), int(line.p1[1])), 
+                                  (int(line.p2[0]), int(line.p2[1])), 
+                                  (0, 255, 0), 2)
+                         # Draw normal vector to show direction
+                         center = ((line.p1[0] + line.p2[0])/2, (line.p1[1] + line.p2[1])/2)
+                         # normal is normalized, scale it for display
+                         end_n = (center[0] + line._normal[0]*20, center[1] + line._normal[1]*20)
+                         cv2.arrowedLine(annotated_frame, 
+                                         (int(center[0]), int(center[1])), 
+                                         (int(end_n[0]), int(end_n[1])), 
+                                         (0, 0, 255), 1)
+
+                    # Update Shared Frame safely
+                    with self.lock:
+                        self.latest_frame = annotated_frame
+                        
                 cap.release()
                 
             except Exception as e:
@@ -223,50 +257,40 @@ class CameraDetector(threading.Thread):
             
             new_classes = camera_config.get('enabled_classes')
             if new_classes:
-                # Assuming classes come as list of strings "person", "car" or ints
-                # Model names is a dict {0: 'person', ...}
-                # We need to map strings to ints
+                # Map class names to IDs... (same logic as before)
                 target_ints = []
-                
-                # Invert model names map for lookup
                 name_to_id = {v: k for k, v in self.model.names.items()}
-                
                 for c in new_classes:
                     if isinstance(c, int):
                         target_ints.append(c)
                     elif isinstance(c, str):
                         if c in name_to_id:
                             target_ints.append(name_to_id[c])
-                            
                 self.target_classes = target_ints
                 
         # 2. Update Counting Lines
         try:
-            new_counters = []
-            for roi in rois:
-                if roi.get('roi_type') == 'line' and roi.get('is_counting_line') and roi.get('is_active'):
-                    coords = roi.get('coordinates', [])
-                    if len(coords) >= 2:
-                        start = [coords[0]['x'], coords[0]['y']]
-                        end = [coords[1]['x'], coords[1]['y']]
-                        
-                        lc = LineCounter(
-                            start_point=start,
-                            end_point=end,
-                            name=roi.get('name', 'Line')
-                        )
-                        lc.roi_id = roi.get('id') # Store ROI UUID
-                        # Restore direction info if needed, or LineCounter handles it? 
-                        # LineCounter logic relies on vector math. 
-                        # Direction in ROI ('in'/'out') is logical.
-                        # We attach ROI metadata to be used in event payload.
-                        lc.direction_label = roi.get('direction', 'in')
-                        
-                        new_counters.append(lc)
+            # Need frame dimensions to denormalize coordinates.
+            # If we haven't processed a frame yet, we might not know dimensions.
+            # Strategy: if we have latest_frame, use it. Else assume standard 1080p or wait?
+            # Better strategy: Store raw ROIs and process them inside the run loop or lazy load.
+            # But line_crossing.py handles conversion.
             
-            # Atomic swap
-            self.line_counters = new_counters
-            # logger.info(f"Updated {len(new_counters)} counting lines.")
+            width = 1920 # Default
+            height = 1080
+            
+            with self.lock:
+                if self.latest_frame is not None:
+                    height, width = self.latest_frame.shape[:2]
+            
+            new_lines = []
+            for roi in rois:
+                line = CountingLine.from_roi(roi, width, height)
+                if line:
+                   new_lines.append(line)
+            
+            self.counting_lines = new_lines
+            logger.info(f"Updated {len(new_lines)} counting lines using resolution {width}x{height}.")
             
         except Exception as e:
             logger.error(f"Failed to update counting lines: {e}")
