@@ -54,6 +54,7 @@ async def lifespan(app: FastAPI):
     # Start Observability Loops
     if camera_manager.api_client:
         asyncio.create_task(camera_manager.api_client.heartbeat_loop())
+        asyncio.create_task(camera_manager.api_client.flush_loop())
         asyncio.create_task(camera_manager.api_client.roi_sync_loop())
     
     yield

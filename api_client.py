@@ -148,6 +148,13 @@ class APIClient:
             await self.send_heartbeat()
             await asyncio.sleep(interval)
             
+    async def flush_loop(self):
+        interval = self.config["viewsense"].get("send_interval_seconds", 2)
+        logger.info(f"Starting flush loop (interval={interval}s)...")
+        while self.running:
+            await asyncio.sleep(interval)
+            await self.flush()
+            
     async def roi_sync_loop(self):
         # Deprecated: Handled by ROISyncManager now, but kept for compatibility logic if needed
         # We will disable the internal loop in main in favor of ROISyncManager
