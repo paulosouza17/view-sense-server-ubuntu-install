@@ -143,6 +143,19 @@ class LineCrossingDetector:
                             "crossed_line": True,
                         })
                         self._counted[key] = direction
+                    else:
+                        # Log ignora para debug
+                        pass # Logger is not available inside this class easily unless passed or global.
+                        # We will let it pass silently here to keep class pure, 
+                        # but in detector.py we capture the output.
+                        # Wait, we can't capture it if we don't return it.
+                        
+                        # Better strategy: Return it with "crossed_line": False or a flag?
+                        # No, that breaks contract.
+                        # Let's import logging here.
+                        import logging
+                        logger = logging.getLogger("line_crossing")
+                        logger.info(f"IGNORED CROSSING: {track_id} -> {direction} on line {line.name} (Config: {line.direction})")
             
             self._track_sides[key] = current_side
         
