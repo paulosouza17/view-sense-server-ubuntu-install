@@ -3,6 +3,13 @@ from contextlib import asynccontextmanager
 import logging
 import asyncio
 import time
+import os
+
+# FFMPEG Timeout Configuration (Crucial for unstable m3u8 streams)
+# Must be set before importing cv2 or starting capture
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "timeout;10000" # 10s timeout
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 
 from camera_manager import CameraManager
 
