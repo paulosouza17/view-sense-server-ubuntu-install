@@ -50,10 +50,9 @@ class CameraDetector(threading.Thread):
         self.crossing_detector = LineCrossingDetector()
         self.counting_lines: List[CountingLine] = []
         
-        # We don't initialize lines here because we wait for ROI Sync.
-        # But if config has local counting_lines, we could load them?
-        # For uniformity, let's rely on ROI Sync to populate this.
-        # Or parse legacy counting_lines if needed.
+        # State for dynamic resolution handling
+        self.raw_rois: List[Dict] = []
+        self.current_resolution: Optional[Tuple[int, int]] = None
         
         self.roi_id = self.config.get('roi_id')
         try:
@@ -110,6 +109,7 @@ class CameraDetector(threading.Thread):
                     ret, frame = cap.read()
                     if not ret:
                         # Stream ended or Connection Lost logic
+                        # Stream ended or Connection Lost logic
                         # If it's a file (mp4), we seek to 0.
                         # If it's a stream (rtsp/hls), seeking usually doesn't work or throws error.
                         
@@ -141,6 +141,15 @@ class CameraDetector(threading.Thread):
                     
                     self.frame_count += 1
                     self.fps_monitor.tick()
+                    
+                    # -------------------------------------------------------------
+                    # DYNAMIC RESOLUTION CHECK
+                    # Ensure counting lines match current video geometry
+                    # -------------------------------------------------------------
+                    height, width = frame.shape[:2]
+                    if self.current_resolution != (width, height):
+                        # Resolution changed or initial frame
+                        self._rebuild_lines(width, height)
                     
                     # Inference
                     results = self.model(frame, verbose=False, conf=self.conf_threshold)[0]
