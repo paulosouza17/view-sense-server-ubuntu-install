@@ -3,7 +3,7 @@ import logging
 import time
 import psutil
 import platform
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 import httpx
 
 # Configure logging
