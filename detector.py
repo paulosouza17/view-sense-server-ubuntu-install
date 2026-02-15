@@ -291,32 +291,34 @@ class CameraDetector(threading.Thread):
                             target_ints.append(name_to_id[c])
                 self.target_classes = target_ints
                 
-        # 2. Update Counting Lines
+        # 2. Store Raw ROIs for Dynamic Resolution Handling
+        # We process them only when we know the frame resolution in the run loop.
+        with self.lock:
+            self.raw_rois = rois
+            # Force rebuild lines on next frame check
+            self.current_resolution = None 
+
+    def _rebuild_lines(self, width: int, height: int):
+        """Rebuilds CountingLine objects with specific resolution."""
+        if not self.raw_rois:
+            self.counting_lines = []
+            return
+
+        logger.info(f"Rebuilding counting lines for resolution {width}x{height}...")
         try:
-            # Need frame dimensions to denormalize coordinates.
-            # If we haven't processed a frame yet, we might not know dimensions.
-            # Strategy: if we have latest_frame, use it. Else assume standard 1080p or wait?
-            # Better strategy: Store raw ROIs and process them inside the run loop or lazy load.
-            # But line_crossing.py handles conversion.
-            
-            width = 1920 # Default
-            height = 1080
-            
-            with self.lock:
-                if self.latest_frame is not None:
-                    height, width = self.latest_frame.shape[:2]
-            
             new_lines = []
-            for roi in rois:
+            for roi in self.raw_rois:
+                # Assuming roi_sync passes clean dicts
                 line = CountingLine.from_roi(roi, width, height)
                 if line:
                    new_lines.append(line)
             
             self.counting_lines = new_lines
-            logger.info(f"Updated {len(new_lines)} counting lines using resolution {width}x{height}.")
+            self.current_resolution = (width, height)
+            logger.info(f"Active counting lines: {len(self.counting_lines)}")
             
         except Exception as e:
-            logger.error(f"Failed to update counting lines: {e}")
+            logger.error(f"Failed to rebuild lines: {e}")
 
     def stop(self):
         self.running = False
