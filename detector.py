@@ -89,6 +89,14 @@ class CameraDetector(threading.Thread):
                 
                 logger.info(f"Successfully connected to stream: {self.source}")
                 
+                 # Optimization for Live Streams (Low Latency)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                
+                # Note: For strict timeout handling with FFMPEG backend, 
+                # strictly speaking one should set os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "timeout;5000"
+                # in main.py before loading cv2, but behavior varies by version.
+                # The generic reconnection loop below handles 'hard' drops effectively.
+                
                 while self.running:
                     ret, frame = cap.read()
                     if not ret:
