@@ -29,6 +29,10 @@ class CameraManager:
         self.roi_manager = ROISyncManager(self.api_client, self.config)
         self.roi_manager.on_roi_change(self.on_roi_updated)
 
+        if hasattr(self, 'api_client_loop') and self.api_client_loop:
+             self.api_client.loop = self.api_client_loop
+             logger.info(f"Assigned Main Loop to API Client: {id(self.api_client.loop)}")
+        
         # Start Camera Detectors
         for cam_conf in self.config['cameras']:
             self._start_camera(cam_conf)

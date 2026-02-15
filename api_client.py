@@ -28,7 +28,11 @@ class APIClient:
         self.api_key = viewsense_conf.get('api_key', '')
         self.anon_key = viewsense_conf.get('anon_key', '')
         
-        self.batch_size = viewsense_conf.get('batch_size', 20)
+        try:
+            self.batch_size = int(viewsense_conf.get('batch_size', 20))
+        except (ValueError, TypeError):
+             logger.warning("Invalid batch_size in config, defaulting to 20.")
+             self.batch_size = 20
         self.queue: List[Dict[str, Any]] = []
         
         # Headers for Supabase Edge Functions
@@ -49,8 +53,10 @@ class APIClient:
 
     async def add_detection(self, detection: Dict[str, Any]):
         """Adds a detection to the buffer and sends if batch size is reached."""
+        logger.info(f"API Client: Received detection for queue. Current queue size: {len(self.queue)}")
         self.queue.append(detection)
         if len(self.queue) >= self.batch_size:
+            logger.info("API Client: Batch size reached, flushing...")
             await self.flush()
 
     async def flush(self):
@@ -86,9 +92,9 @@ class APIClient:
 
     async def _send_with_retry(self, url: str, json_payload: Dict[str, Any], max_retries: int = 3):
         if not url:
-             logger.error("No URL configured for this operation.")
-             return
-
+             logger.error("No URL configured for this operation. Check config.yaml.")
+             raise ValueError("Missing API URL")
+             
         for attempt in range(max_retries):
             try:
                 response = await self.client.post(url, json=json_payload)

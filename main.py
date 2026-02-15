@@ -45,7 +45,9 @@ async def lifespan(app: FastAPI):
     
     # We'll set the loop explicitly.
     
+    loop = asyncio.get_running_loop()
     camera_manager.api_client_loop = loop 
+    logger.info(f"Main Loop ID: {id(loop)}")
     
     camera_manager.start()
     

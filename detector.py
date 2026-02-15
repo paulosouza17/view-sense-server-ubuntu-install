@@ -227,10 +227,26 @@ class CameraDetector(threading.Thread):
                             
                             # Send to API Client ONLY if line crossed (Optimization for Counting)
                             if self.api_client and detection_payload["crossed_line"]:
-                                asyncio.run_coroutine_threadsafe(
-                                    self.api_client.add_detection(detection_payload),
-                                    self.api_client.loop
-                                )
+                                if not self.api_client.loop or self.api_client.loop.is_closed():
+                                    logger.error(f"API Client loop is closed or missing. Cannot send detection.")
+                                    continue
+                                
+                                logger.info(f"Triggering API send for track {str_track_id} (Loop: {self.api_client.loop})")
+                                try:
+                                    future = asyncio.run_coroutine_threadsafe(
+                                        self.api_client.add_detection(detection_payload),
+                                        self.api_client.loop
+                                    )
+                                    # Optional: Add callback to log exceptions from the coroutine
+                                    def handle_future_result(f):
+                                        try:
+                                            f.result()
+                                        except Exception as e:
+                                            logger.error(f"Error in scheduled API call: {e}")
+                                            
+                                    future.add_done_callback(handle_future_result)
+                                except Exception as e:
+                                    logger.error(f"Failed to schedule API call: {e}")
                     
                     # Cleanup stale tracks from crossing detector
                     self.crossing_detector.cleanup_stale_tracks(active_track_ids)
