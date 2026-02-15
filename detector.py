@@ -1,4 +1,4 @@
-```python
+
 import time
 import logging
 import cv2
