@@ -93,7 +93,7 @@ class APIClient:
             try:
                 response = await self.client.post(url, json=json_payload)
                 response.raise_for_status()
-                # logger.debug(f"Successfully sent payload to {url}")
+                logger.info(f"Successfully sent payload to {url} (Status: {response.status_code})")
                 return
             except httpx.HTTPError as e:
                 logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for {url}: {e}")

@@ -2,7 +2,7 @@ viewsense:
   api_url: "https://dwtzkynjbcwrdqlnmktj.supabase.co/functions/v1/ingest-detections"
   api_key: "SUA_CHAVE_AQUI"
   send_interval_seconds: 2
-  batch_size: 10
+  batch_size: 1
   heartbeat_interval_seconds: 60
   roi_sync_interval_seconds: 60
 

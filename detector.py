@@ -1,8 +1,10 @@
+```python
 import time
 import logging
 import cv2
 import threading
 from typing import Dict, Any, List, Optional
+from datetime import datetime
 import supervision as sv
 from ultralytics import YOLO
 import numpy as np
@@ -195,6 +197,7 @@ class CameraDetector(threading.Thread):
                             # Prepare Payload
                             detection_payload = {
                                 "camera_id": self.camera_id,
+                                "timestamp": datetime.utcnow().isoformat() + "Z", # UTC ISO8601
                                 "detection_class": self.model.names[detections.class_id[i]],
                                 "confidence": float(detections.confidence[i]),
                                 "track_id": str_track_id,
