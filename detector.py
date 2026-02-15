@@ -25,6 +25,10 @@ class CameraDetector(threading.Thread):
         self.running = False
         self.camera_id = self.config['id']
         self.source = self.config['stream_url']
+        # Support for local USB cameras (index 0, 1, etc.)
+        if isinstance(self.source, str) and self.source.isdigit():
+            self.source = int(self.source)
+        
         self.model_name = self.config.get('model', 'yolov8n.pt')
         self.conf_threshold = self.config.get('confidence_threshold', 0.5)
         self.target_classes = self.config.get('classes', [0]) # Default to person
