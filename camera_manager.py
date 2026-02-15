@@ -1,4 +1,12 @@
+import yaml
+import logging
+import asyncio
+from typing import Dict
+from api_client import APIClient
+from detector import CameraDetector
 from roi_sync import ROISyncManager
+
+logger = logging.getLogger(__name__)
 
 class CameraManager:
     def __init__(self, config_path: str = "config.yaml"):
