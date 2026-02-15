@@ -229,8 +229,8 @@ class CameraDetector(threading.Thread):
                                 })
                                 logger.info(f"CROSSING: {str_track_id} -> {crossing['direction']} on {crossing['roi_id']}")
                             
-                            # Send to API Client
-                            if self.api_client:
+                            # Send to API Client ONLY if line crossed (Optimization for Counting)
+                            if self.api_client and detection_payload["crossed_line"]:
                                 asyncio.run_coroutine_threadsafe(
                                     self.api_client.add_detection(detection_payload),
                                     self.api_client.loop
