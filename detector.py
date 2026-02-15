@@ -118,6 +118,20 @@ class CameraDetector(threading.Thread):
                         if is_local_file:
                             logger.info(f"File end reached for {self.camera_id}. Looping...")
                             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            
+                            # RESET TRACKING STATE ON LOOP RESTART
+                            # This is critical so that objects are re-counted as new people in the next loop.
+                            try:
+                                fps = self.config.get('fps', 30)
+                                self.tracker = sv.ByteTrack(frame_rate=fps)
+                                # Preserve existing counting lines but clear crossing state
+                                current_lines = self.counting_lines 
+                                self.crossing_detector = LineCrossingDetector()
+                                # No need to re-add lines, just pass them in update()
+                                logger.info("Tracker and Crossing Detector reset for loop.")
+                            except Exception as e:
+                                logger.error(f"Error resetting tracker on loop: {e}")
+
                             ret, frame = cap.read()
                         
                         if not ret:
