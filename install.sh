@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ViewSense PM2 Edge Worker - Automated Installer for Ubuntu/Debian
-# Usage: sudo ./install.sh
+# Usage: sudo ./install.sh (run from inside the cloned folder)
 
 set -e
 
@@ -16,100 +16,120 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+# The worker files are in this same directory
+SOURCE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 USER_NAME=${SUDO_USER:-$USER}
 HOME_DIR=$(getent passwd "$USER_NAME" | cut -d: -f6)
 WORKER_DIR="$HOME_DIR/viewsense-ai-worker"
 
-echo -e "${GREEN}[1/5] Installing System Dependencies...${NC}"
-apt-get update
+echo -e "${GREEN}[1/6] Installing System Dependencies...${NC}"
+apt-get update -qq
 apt-get install -y curl git build-essential python3 python3-venv python3-pip python3-dev libgl1 libglib2.0-0 ffmpeg
 
-echo -e "${GREEN}[2/5] Setting up Node.js & PM2...${NC}"
+echo -e "${GREEN}[2/6] Setting up Node.js 20 & PM2...${NC}"
 if ! command -v pm2 &> /dev/null; then
-  echo "Installing Node.js and PM2..."
+  echo "Installing Node.js 20..."
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
   apt-get install -y nodejs
   npm install -g pm2
+  echo "PM2 installed successfully."
 else
-  echo "PM2 is already installed."
+  echo "PM2 already installed ($(pm2 --version))."
 fi
 
-echo -e "${GREEN}[3/5] Downloading Edge Worker Source Code...${NC}"
+echo -e "${GREEN}[3/6] Copying Edge Worker files to $WORKER_DIR...${NC}"
 if [ -d "$WORKER_DIR" ]; then
-    echo -e "${RED}Directory $WORKER_DIR already exists. Backing up...${NC}"
-    mv "$WORKER_DIR" "${WORKER_DIR}_backup_$(date +%s)"
+  echo "Backing up existing install..."
+  mv "$WORKER_DIR" "${WORKER_DIR}_backup_$(date +%s)"
 fi
+mkdir -p "$WORKER_DIR"
+# Copy worker source files (exclude installer files and git)
+rsync -a --exclude='.git' --exclude='install.sh' --exclude='install_mac.sh' --exclude='install_ubuntu.sh' --exclude='*.md' --exclude='Dockerfile' --exclude='docker-compose.yml' "$SOURCE_DIR/" "$WORKER_DIR/"
+chown -R "$USER_NAME:$USER_NAME" "$WORKER_DIR"
+echo "Files copied to $WORKER_DIR"
 
-# Use sparse-checkout to grab ONLY the edge-worker-mac folder from the monorepo
-sudo -u $USER_NAME mkdir -p "$WORKER_DIR"
+echo -e "${GREEN}[4/6] Setting up Python Virtual Environment...${NC}"
 cd "$WORKER_DIR"
-sudo -u $USER_NAME git init
-sudo -u $USER_NAME git remote add origin https://github.com/paulosouza17/vision-audit-hub.git
-sudo -u $USER_NAME git config core.sparseCheckout true
-sudo -u $USER_NAME bash -c 'echo "edge-worker-mac/*" >> .git/info/sparse-checkout'
-echo "Pulling worker code from Github..."
-sudo -u $USER_NAME git pull origin main
-# Move contents up one level and clean git
-mv edge-worker-mac/* .
-rm -rf edge-worker-mac .git
-
-echo -e "${GREEN}[4/5] Setting up Python Virtual Environment...${NC}"
 if [ ! -d "venv" ]; then
-    sudo -u $USER_NAME python3 -m venv venv
-    echo "Virtual environment created."
+  sudo -u "$USER_NAME" python3 -m venv venv
+  echo "Virtual environment created."
 fi
 
-echo -e "${GREEN}[5/5] Installing Python Requirements & PM2 Ecosystem...${NC}"
-sudo -H -u $USER_NAME bash -c "source venv/bin/activate && pip install --upgrade pip"
-if [ -f "requirements.txt" ]; then
-    sudo -H -u $USER_NAME bash -c "source venv/bin/activate && pip install -r requirements.txt"
+echo -e "${GREEN}[5/6] Installing Python Requirements...${NC}"
+sudo -H -u "$USER_NAME" bash -c "source '$WORKER_DIR/venv/bin/activate' && pip install --upgrade pip --quiet"
+if [ -f "$WORKER_DIR/requirements.txt" ]; then
+  echo "Installing packages (this may take a few minutes)..."
+  sudo -H -u "$USER_NAME" bash -c "source '$WORKER_DIR/venv/bin/activate' && pip install -r '$WORKER_DIR/requirements.txt' --quiet"
+  echo "Python packages installed."
 else
-    echo -e "${RED}Fatal Error: requirements.txt not found after download!${NC}"
-    exit 1
+  echo -e "${RED}requirements.txt not found!${NC}"
+  exit 1
 fi
+
+echo -e "${GREEN}[6/6] Configuring PM2 Ecosystem...${NC}"
+cd "$WORKER_DIR"
 
 if [ ! -f "ecosystem.config.js" ]; then
-    cat > ecosystem.config.js <<EOF
+  cat > ecosystem.config.js <<EOF
 module.exports = {
   apps: [
     {
       name: "viewsense-rtmp",
-      script: "venv/bin/python",
-      args: "rtmp_engine.py",
+      script: "$WORKER_DIR/venv/bin/python",
+      args: "$WORKER_DIR/rtmp_engine.py",
+      cwd: "$WORKER_DIR",
       interpreter: "none",
       autorestart: true,
       max_restarts: 50,
       watch: false,
+      env: { PYTHONUNBUFFERED: "1" }
     },
     {
       name: "viewsense-health",
-      script: "venv/bin/python",
-      args: "server_health.py",
+      script: "$WORKER_DIR/venv/bin/python",
+      args: "$WORKER_DIR/server_health.py",
+      cwd: "$WORKER_DIR",
       interpreter: "none",
       autorestart: true,
       watch: false,
+      env: { PYTHONUNBUFFERED: "1" }
     },
     {
       name: "viewsense-ai-worker",
-      script: "venv/bin/python",
-      args: "detector.py",
+      script: "$WORKER_DIR/venv/bin/python",
+      args: "$WORKER_DIR/detector.py",
+      cwd: "$WORKER_DIR",
       interpreter: "none",
       autorestart: true,
       watch: false,
+      env: { PYTHONUNBUFFERED: "1" }
     }
   ]
 };
 EOF
-    chown $USER_NAME:$USER_NAME ecosystem.config.js
+  chown "$USER_NAME:$USER_NAME" ecosystem.config.js
+  echo "ecosystem.config.js created."
 fi
 
-# Run PM2 Startup directly
-env PATH=$PATH:/usr/bin /usr/lib/node_modules/pm2/bin/pm2 startup systemd -u $USER_NAME --hp $HOME_DIR
+# Configure PM2 to start on system boot
+echo "Configuring PM2 startup..."
+env PATH=$PATH:/usr/bin /usr/lib/node_modules/pm2/bin/pm2 startup systemd -u "$USER_NAME" --hp "$HOME_DIR" 2>/dev/null || true
 
+echo ""
 echo -e "${GREEN}====================================================${NC}"
-echo -e "${GREEN}ViewSense Edge Worker Core Successfully Installed!${NC}"
-echo -e "Next steps:"
-echo -e "1. CD into the worker directory:\n   cd $WORKER_DIR"
-echo -e "2. Download your camera config.yaml using the specific cURL command from your Panel."
-echo -e "3. Start the AI processes:\n   pm2 start ecosystem.config.js && pm2 save"
+echo -e "${GREEN}  ViewSense Edge Worker installed successfully! ✅  ${NC}"
 echo -e "${GREEN}====================================================${NC}"
+echo ""
+echo "Worker directory: $WORKER_DIR"
+echo ""
+echo "NEXT STEPS:"
+echo ""
+echo "  1. Download your config.yaml using the command shown in the panel:"
+echo "     curl -H \"x-api-key: YOUR_KEY\" \"YOUR_BOOTSTRAP_URL\" -o $WORKER_DIR/config.yaml"
+echo ""
+echo "  2. Start the AI processes:"
+echo "     cd $WORKER_DIR && pm2 start ecosystem.config.js && pm2 save"
+echo ""
+echo "  3. View logs:"
+echo "     pm2 logs"
+echo ""
