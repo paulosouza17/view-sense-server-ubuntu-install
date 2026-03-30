@@ -1,113 +1,115 @@
 #!/bin/bash
 
-# ViewSense YOLO Server - Auto Installer for Ubuntu
+# ViewSense PM2 Edge Worker - Automated Installer for Ubuntu/Debian
 # Usage: sudo ./install.sh
 
 set -e
 
 GREEN='\033[0;32m'
+RED='\033[0;31m'
 NC='\033[0m'
 
-echo -e "${GREEN}Starting ViewSense YOLO Server Installation...${NC}"
+echo -e "${GREEN}Starting ViewSense AI Edge Worker Installation...${NC}"
 
-# Check for root/sudo
 if [ "$EUID" -ne 0 ]; then
-  echo "Please run as root (sudo ./install.sh)"
+  echo -e "${RED}Please run as root (sudo ./install.sh)${NC}"
   exit 1
 fi
 
-APP_DIR=$(pwd)
 USER_NAME=${SUDO_USER:-$USER}
+HOME_DIR=$(getent passwd "$USER_NAME" | cut -d: -f6)
+WORKER_DIR="$HOME_DIR/viewsense-ai-worker"
 
-echo -e "${GREEN}Updating Package Lists...${NC}"
-apt update
+echo -e "${GREEN}[1/5] Installing System Dependencies...${NC}"
+apt-get update
+apt-get install -y curl git build-essential python3 python3-venv python3-pip python3-dev libgl1 libglib2.0-0 ffmpeg
 
-echo -e "${GREEN}Installing System Dependencies...${NC}"
-# Ubuntu 24.04 (Noble) compatibility fixes:
-# - python3.11 might not be available, python3 (3.12) is default
-# - libgl1-mesa-glx is deprecated, use libgl1
-apt install -y python3 python3-venv python3-pip python3-dev build-essential libgl1 git
-
-# Create Virtual Environment
-echo -e "${GREEN}Setting up Python Virtual Environment...${NC}"
-if [ ! -d "venv" ]; then
-    # Use generic python3 command which points to the system's latest (3.12 on Noble)
-    python3 -m venv venv
-    chown -R $USER_NAME:$USER_NAME venv
-    echo "Virtual environment created."
+echo -e "${GREEN}[2/5] Setting up Node.js & PM2...${NC}"
+if ! command -v pm2 &> /dev/null; then
+  echo "Installing Node.js and PM2..."
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y nodejs
+  npm install -g pm2
 else
-    echo "Virtual environment already exists."
+  echo "PM2 is already installed."
 fi
 
-# Activate and Install Requirements
-echo -e "${GREEN}Installing Python Requirements...${NC}"
-source venv/bin/activate
-pip install --upgrade pip
+echo -e "${GREEN}[3/5] Downloading Edge Worker Source Code...${NC}"
+if [ -d "$WORKER_DIR" ]; then
+    echo -e "${RED}Directory $WORKER_DIR already exists. Backing up...${NC}"
+    mv "$WORKER_DIR" "${WORKER_DIR}_backup_$(date +%s)"
+fi
+
+# Use sparse-checkout to grab ONLY the edge-worker-mac folder from the monorepo
+sudo -u $USER_NAME mkdir -p "$WORKER_DIR"
+cd "$WORKER_DIR"
+sudo -u $USER_NAME git init
+sudo -u $USER_NAME git remote add origin https://github.com/paulosouza17/vision-audit-hub.git
+sudo -u $USER_NAME git config core.sparseCheckout true
+sudo -u $USER_NAME bash -c 'echo "edge-worker-mac/*" >> .git/info/sparse-checkout'
+echo "Pulling worker code from Github..."
+sudo -u $USER_NAME git pull origin main
+# Move contents up one level and clean git
+mv edge-worker-mac/* .
+rm -rf edge-worker-mac .git
+
+echo -e "${GREEN}[4/5] Setting up Python Virtual Environment...${NC}"
+if [ ! -d "venv" ]; then
+    sudo -u $USER_NAME python3 -m venv venv
+    echo "Virtual environment created."
+fi
+
+echo -e "${GREEN}[5/5] Installing Python Requirements & PM2 Ecosystem...${NC}"
+sudo -H -u $USER_NAME bash -c "source venv/bin/activate && pip install --upgrade pip"
 if [ -f "requirements.txt" ]; then
-    # Install dependencies
-    pip install -r requirements.txt
+    sudo -H -u $USER_NAME bash -c "source venv/bin/activate && pip install -r requirements.txt"
 else
-    echo "requirements.txt not found!"
+    echo -e "${RED}Fatal Error: requirements.txt not found after download!${NC}"
     exit 1
 fi
 
-# Download YOLO model to cache it
-echo -e "${GREEN}Downloading default YOLO model...${NC}"
-python3 -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
-
-# Create Systemd Service
-echo -e "${GREEN}Creating Systemd Service...${NC}"
-SERVICE_FILE="/etc/systemd/system/viewsense-yolo.service"
-
-cat > $SERVICE_FILE <<EOF
-[Unit]
-Description=ViewSense YOLO Detection Server
-After=network.target
-
-[Service]
-User=$USER_NAME
-WorkingDirectory=$APP_DIR
-ExecStart=$APP_DIR/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8080
-Restart=always
-RestartSec=10
-Environment=PYTHONUNBUFFERED=1
-
-[Install]
-WantedBy=multi-user.target
+if [ ! -f "ecosystem.config.js" ]; then
+    cat > ecosystem.config.js <<EOF
+module.exports = {
+  apps: [
+    {
+      name: "viewsense-rtmp",
+      script: "venv/bin/python",
+      args: "rtmp_engine.py",
+      interpreter: "none",
+      autorestart: true,
+      max_restarts: 50,
+      watch: false,
+    },
+    {
+      name: "viewsense-health",
+      script: "venv/bin/python",
+      args: "server_health.py",
+      interpreter: "none",
+      autorestart: true,
+      watch: false,
+    },
+    {
+      name: "viewsense-ai-worker",
+      script: "venv/bin/python",
+      args: "detector.py",
+      interpreter: "none",
+      autorestart: true,
+      watch: false,
+    }
+  ]
+};
 EOF
+    chown $USER_NAME:$USER_NAME ecosystem.config.js
+fi
 
-echo "Service file created at $SERVICE_FILE"
+# Run PM2 Startup directly
+env PATH=$PATH:/usr/bin /usr/lib/node_modules/pm2/bin/pm2 startup systemd -u $USER_NAME --hp $HOME_DIR
 
-# Enable and Start Service
-systemctl daemon-reload
-systemctl enable viewsense-yolo
-
-# Create Systemd Path Unit for Auto-Restart on Config Change
-echo -e "${GREEN}Creating Systemd Path Unit (Config Watcher)...${NC}"
-PATH_UNIT_FILE="/etc/systemd/system/viewsense-yolo.path"
-
-cat > $PATH_UNIT_FILE <<EOF
-[Unit]
-Description=Monitor config.yaml for changes to restart ViewSense YOLO
-
-[Path]
-PathModified=$APP_DIR/config.yaml
-Unit=viewsense-yolo.service
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl enable viewsense-yolo.path
-systemctl start viewsense-yolo.path
-echo "✅ Auto-restart on config change enabled."
-
-# We don't start the main service immediately to allow user to config
-# systemctl start viewsense-yolo
-
-echo -e "${GREEN}Installation Complete!${NC}"
-echo "------------------------------------------------"
-echo "1. Edit config.yaml with your camera settings."
-echo "2. Start the service: sudo systemctl start viewsense-yolo"
-echo "3. Check logs: sudo journalctl -u viewsense-yolo -f"
-echo "------------------------------------------------"
+echo -e "${GREEN}====================================================${NC}"
+echo -e "${GREEN}ViewSense Edge Worker Core Successfully Installed!${NC}"
+echo -e "Next steps:"
+echo -e "1. CD into the worker directory:\n   cd $WORKER_DIR"
+echo -e "2. Download your camera config.yaml using the specific cURL command from your Panel."
+echo -e "3. Start the AI processes:\n   pm2 start ecosystem.config.js && pm2 save"
+echo -e "${GREEN}====================================================${NC}"
