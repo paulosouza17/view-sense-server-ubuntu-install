@@ -74,33 +74,13 @@ if [ ! -f "ecosystem.config.js" ]; then
 module.exports = {
   apps: [
     {
-      name: "viewsense-rtmp",
+      name: "viewsense-ai-worker",
       script: "$WORKER_DIR/venv/bin/python",
-      args: "$WORKER_DIR/rtmp_engine.py",
+      args: "$WORKER_DIR/main.py",
       cwd: "$WORKER_DIR",
       interpreter: "none",
       autorestart: true,
       max_restarts: 50,
-      watch: false,
-      env: { PYTHONUNBUFFERED: "1" }
-    },
-    {
-      name: "viewsense-health",
-      script: "$WORKER_DIR/venv/bin/python",
-      args: "$WORKER_DIR/server_health.py",
-      cwd: "$WORKER_DIR",
-      interpreter: "none",
-      autorestart: true,
-      watch: false,
-      env: { PYTHONUNBUFFERED: "1" }
-    },
-    {
-      name: "viewsense-ai-worker",
-      script: "$WORKER_DIR/venv/bin/python",
-      args: "$WORKER_DIR/detector.py",
-      cwd: "$WORKER_DIR",
-      interpreter: "none",
-      autorestart: true,
       watch: false,
       env: { PYTHONUNBUFFERED: "1" }
     }
