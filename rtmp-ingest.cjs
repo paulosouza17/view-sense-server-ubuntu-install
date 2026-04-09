@@ -145,6 +145,31 @@ const snapServer = http.createServer((req, res) => {
     return;
   }
 
+  // Handle HLS requests serving index.m3u8 and .ts natively
+  if (p.startsWith('/live/')) {
+    const pSegs = p.replace('/live/', '').split('/');
+    if (pSegs.length === 2) {
+      const key = pSegs[0];
+      const filename = pSegs[1];
+      const filepath = path.join(MEDIA_ROOT, 'live', key, filename);
+      if (fs.existsSync(filepath)) {
+        if (filename.endsWith('.m3u8')) {
+          res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+          res.setHeader('Cache-Control', 'no-cache');
+        } else if (filename.endsWith('.ts')) {
+          res.setHeader('Content-Type', 'video/mp2t');
+        }
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.writeHead(200);
+        fs.createReadStream(filepath).pipe(res);
+      } else {
+        res.writeHead(404);
+        res.end('HLS Not Found');
+      }
+      return;
+    }
+  }
+
   // Health check
   if (p === '/health') {
     res.setHeader('Content-Type', 'application/json');
