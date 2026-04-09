@@ -78,9 +78,8 @@ setInterval(() => {
 }, 30000);
 
 // Also capture on stream publish
-nms.on('postPublish', (id, args) => {
-  // node-media-server v4: args may be an object {streamPath} or a string
-  const rawPath = (typeof args === 'string' ? args : (args && (args.streamPath || args.path || '')));
+nms.on('postPublish', (session) => {
+  const rawPath = session.streamPath || session.publishStreamPath || '';
   if (!rawPath) return;
   const key = rawPath.replace('/live/', '');
   console.log(`[RTMP] Stream publicado: ${key}`);
@@ -110,8 +109,8 @@ nms.on('postPublish', (id, args) => {
   setTimeout(() => captureSnapshot(key), 5000);
 });
 
-nms.on('donePublish', (id, args) => {
-  const rawPath = (typeof args === 'string' ? args : (args && (args.streamPath || args.path || '')));
+nms.on('donePublish', (session) => {
+  const rawPath = session.streamPath || session.publishStreamPath || '';
   if (!rawPath) return;
   const key = rawPath.replace('/live/', '');
   console.log(`[RTMP] Stream encerrado: ${key}`);
