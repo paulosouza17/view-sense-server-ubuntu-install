@@ -2,7 +2,7 @@ import time
 import logging
 import numpy as np
 import supervision as sv
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -10,116 +10,145 @@ logger = logging.getLogger(__name__)
 @dataclass
 class MonitoredZone:
     """Represents a zone for dwell time monitoring."""
-    pool_id: str
+    roi_id: str
     name: str
-    polygon: np.ndarray # Shape (N, 2)
-    # Configuration
-    min_dwell_time: float = 1.0 # Minimum seconds to count as specific event?
-    
-    # Internal State
-    # {track_id: start_time}
+    polygon: np.ndarray  # Shape (N, 2) in pixel coords
+    min_dwell_time: float = 1.0
+
+    # Internal State: {track_id: enter_time}
     current_objects: Dict[str, float] = field(default_factory=dict)
-    
+
     # Supervision Zone
     _sv_zone: sv.PolygonZone = field(init=False, repr=False)
-    
+
     def __post_init__(self):
-        # Initialize Supervision PolygonZone
-        # triggering_anchors sets where on the box we check (CENTER, BOTTOM_CENTER, etc)
         self._sv_zone = sv.PolygonZone(
             polygon=self.polygon,
             triggering_anchors=(sv.Position.BOTTOM_CENTER,)
         )
 
+
 class ZoneMonitor:
     """
-    Manages multiple zones and tracks dwell time for objects.
+    Manages multiple dwell-time zones and tracks how long objects stay inside.
     """
-    def __init__(self, frame_resolution_wh: Tuple[int, int]):
+    def __init__(self):
         self.zones: List[MonitoredZone] = []
-        self.resolution_wh = frame_resolution_wh
-        
-    def add_zone(self, pool_id: str, name: str, polygon_points: List[List[int]]):
+
+    def rebuild_zones(self, rois: List[Dict[str, Any]], width: int, height: int):
         """
-        Add a zone to monitor.
-        polygon_points: List of [x, y]
+        Rebuild zones from ROI configs (synced from backend).
+        Only includes ROIs where is_dwell_zone=True and roi_type is rectangle or polygon.
+        Coordinates are expected normalized (0-1) and converted to pixel coords.
         """
-        poly = np.array(polygon_points, dtype=np.int32)
-        zone = MonitoredZone(pool_id=pool_id, name=name, polygon=poly)
-        self.zones.append(zone)
-        logger.info(f"Added zone '{name}' with {len(polygon_points)} points.")
+        self.zones.clear()
+
+        for roi in rois:
+            if not roi.get("is_dwell_zone"):
+                continue
+            if roi.get("roi_type") not in ("rectangle", "polygon"):
+                continue
+            if not roi.get("is_active", True):
+                continue
+
+            coords = roi.get("coordinates", [])
+            if len(coords) < 3:
+                continue
+
+            # Convert normalized coords to pixel coords
+            points = []
+            for pt in coords:
+                px = pt.get("x", 0)
+                py = pt.get("y", 0)
+                # Detect if already in pixels or normalized
+                if px <= 1.0 and py <= 1.0:
+                    px = px * width
+                    py = py * height
+                points.append([int(px), int(py)])
+
+            poly = np.array(points, dtype=np.int32)
+            zone = MonitoredZone(
+                roi_id=roi["id"],
+                name=roi.get("name", "Zone"),
+                polygon=poly,
+            )
+            self.zones.append(zone)
+            logger.info(f"🟦 Dwell zone '{zone.name}' added ({len(points)} pts, roi={zone.roi_id})")
+
+        logger.info(f"ZoneMonitor: {len(self.zones)} dwell zones active")
+
+    _frame_count: int = 0
 
     def update(self, detections: sv.Detections) -> List[Dict[str, Any]]:
         """
-        Update zones with new detections and return Dwell Time events.
-        events: [{
-            "type": "zone_exit" | "zone_entry",
-            "zone_id": str,
-            "track_id": str,
-            "dwell_time": float (seconds),
-            "timestamp": isoformat
-        }]
+        Update zones with new detections and return dwell-time events.
+        Returns list of dicts:
+          {type, roi_id, track_id, dwell_time, detection_class, confidence}
         """
         events = []
         current_time = time.time()
-        
-        # We need tracker_id to track dwell time
-        if detections.tracker_id is None:
+        self._frame_count += 1
+
+        if detections.tracker_id is None or len(self.zones) == 0:
             return []
 
         for zone in self.zones:
-            # Check which detections are inside the zone
-            # zone._sv_zone.trigger returns a boolean mask
             is_in_zone = zone._sv_zone.trigger(detections=detections)
-            
-            # IDs currently inside
             ids_in_zone = detections.tracker_id[is_in_zone]
-            str_ids_in_zone = set(str(id) for id in ids_in_zone)
-            
-            # 1. Handle NEW Entries
+            str_ids_in_zone = set(str(tid) for tid in ids_in_zone)
+
+            # Debug: periodic logging
+            if self._frame_count % 50 == 0:
+                n_total = len(detections.tracker_id)
+                n_inside = int(is_in_zone.sum())
+                n_tracked = len(zone.current_objects)
+                zmin = zone.polygon.min(axis=0).tolist()
+                zmax = zone.polygon.max(axis=0).tolist()
+                # Show a few bottom-center positions
+                if detections.xyxy is not None and len(detections.xyxy) > 0:
+                    bcs = []
+                    for box in detections.xyxy[:3]:
+                        bcx = (box[0] + box[2]) / 2
+                        bcy = box[3]  # bottom
+                        bcs.append(f"({bcx:.0f},{bcy:.0f})")
+                    bc_str = " ".join(bcs)
+                else:
+                    bc_str = "no-boxes"
+                logger.info(
+                    f"🔍 Zone '{zone.name}': {n_inside}/{n_total} in zone, "
+                    f"{n_tracked} tracked | zone=[{zmin}→{zmax}] | bc=[{bc_str}]"
+                )
+
+            # Build lookup for detection info
+            det_info = {}
+            for i, tid in enumerate(detections.tracker_id):
+                det_info[str(tid)] = {
+                    "class_id": int(detections.class_id[i]) if detections.class_id is not None else 0,
+                    "confidence": float(detections.confidence[i]) if detections.confidence is not None else 0.0,
+                }
+
+            # Handle new entries
             for track_id in str_ids_in_zone:
                 if track_id not in zone.current_objects:
-                    # New detection in zone
                     zone.current_objects[track_id] = current_time
-                    logger.debug(f"Track {track_id} entered zone {zone.name}")
-                    # Optional: Emit entry event? 
-                    # Usually entry is less interesting than exit/dwell, but we can store it.
-            
-            # 2. Handle Exits (Objects in 'current_objects' but NOT in 'str_ids_in_zone')
-            # BUT: We must be careful about lost tracking. 
-            # Ideally, we only consider it an "Exit" if the tracker is still active but outside the zone.
-            # However, if detection is lost entirely, we might assume they left or are occluded.
-            # For simplicity: If they are not in the zone in this frame, they exited (or disappeared).
-            
-            # To be robust, we should check if the track_id exists in the current frame's detections *at all*.
-            # If it exists in frame but not in zone -> Valid Exit.
-            # If it doesn't exist in frame -> Lost Track (maybe still in zone, maybe not).
-            
-            # Let's get all track IDs present in the current frame
-            all_active_track_ids = set(str(id) for id in detections.tracker_id)
-            
-            detected_exits = []
-            for track_id_in_zone, start_time in list(zone.current_objects.items()):
-                if track_id_in_zone not in str_ids_in_zone:
-                    # It is NOT in the zone anymore.
-                    
-                    # Check if it is still in the frame (valid exit)
-                    # or if it disappeared (signal drift/occlusion)
-                    # For simple dwell time, we often count disappearance as exit if we don't have re-id.
-                    # But let's assume if it's visible elsewhere, it definitely exited.
-                    
+
+            # Handle exits
+            for track_id, start_time in list(zone.current_objects.items()):
+                if track_id not in str_ids_in_zone:
                     duration = current_time - start_time
-                    
                     if duration >= zone.min_dwell_time:
-                         events.append({
+                        info = det_info.get(track_id, {})
+                        events.append({
                             "type": "zone_dwell",
-                            "zone_id": zone.pool_id,
-                            "track_id": track_id_in_zone,
+                            "roi_id": zone.roi_id,
+                            "track_id": track_id,
                             "dwell_time": round(duration, 2),
-                            "action": "exit" # or "summary"
+                            "class_id": info.get("class_id", 0),
+                            "confidence": info.get("confidence", 0.0),
                         })
-                         logger.info(f"Dwell Event: {track_id_in_zone} stayed {duration:.1f}s in {zone.name}")
-                    
-                    del zone.current_objects[track_id_in_zone]
+                        logger.info(
+                            f"⏱️ Dwell: track {track_id} stayed {duration:.1f}s in '{zone.name}'"
+                        )
+                    del zone.current_objects[track_id]
 
         return events

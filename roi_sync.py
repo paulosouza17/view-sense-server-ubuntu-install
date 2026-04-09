@@ -1,8 +1,17 @@
 import asyncio
+import json
 import logging
+import os
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List, Any
 
 logger = logging.getLogger(__name__)
+
+# Brasília = UTC-3
+BRASILIA_TZ = timezone(timedelta(hours=-3))
+
+# Canonical path where the RTMP server reads the whitelist
+ACTIVE_STREAMS_PATH = "/opt/viewsense/active_streams.json"
 
 class ROISyncManager:
     """Gerencia sincronização periódica de ROIs com o painel ViewSense."""
@@ -97,7 +106,10 @@ class ROISyncManager:
                             cb(cam_id, rois, cam_config)
                         except Exception as e:
                             logger.error(f"Erro em callback ROI: {e}")
-            
+
+            # Always refresh active_streams.json based on current schedules
+            self._update_active_streams(new_cameras_map)
+
             # Tratar atualização de versão pendente (log apenas por enquanto)
             if pending_update:
                 logger.warning(
@@ -140,7 +152,7 @@ class ROISyncManager:
             new_conf = new_cameras_map.get(cam_id, {})
             
             # Check specific fields that affect detection
-            relevant_fields = ['confidence_threshold', 'enabled_classes', 'fps']
+            relevant_fields = ['confidence_threshold', 'enabled_classes', 'fps', 'demographics_enabled']
             
             # If camera config is completely new or missing
             if not old_conf and new_conf:
@@ -168,3 +180,86 @@ class ROISyncManager:
 
     def get_camera_config(self, camera_id: str) -> Optional[dict]:
         return self.current_cameras.get(camera_id)
+
+    # ─── Schedule / Active Streams ───────────────────────────────────────────
+
+    @staticmethod
+    def _is_camera_active(cam: dict) -> bool:
+        """Returns True if camera should be streaming now (Brasília time).
+
+        Rules:
+        - ai_enabled=False  → never active (AI turned off in frontend)
+        - schedule_enabled=False or missing → always active (no restriction)
+        - schedule_enabled=True → check day-of-week and time window
+        """
+        if not cam.get('ai_enabled', True):
+            return False
+
+        if not cam.get('schedule_enabled', False):
+            return True  # No schedule restriction — always allow
+
+        now_brt = datetime.now(BRASILIA_TZ)
+        current_weekday = now_brt.weekday()  # Mon=0 … Sun=6
+        # DB stores 0=Sunday … 6=Saturday (JS convention)
+        # Convert Python weekday to JS: Mon=1, Tue=2, …, Sun=0
+        js_weekday = (current_weekday + 1) % 7
+
+        schedule_days = cam.get('schedule_days') or list(range(7))
+        if js_weekday not in schedule_days:
+            return False
+
+        # Parse HH:MM:SS strings
+        def parse_time(t: str):
+            try:
+                parts = t.split(':')
+                return now_brt.replace(
+                    hour=int(parts[0]), minute=int(parts[1]),
+                    second=int(parts[2]) if len(parts) > 2 else 0,
+                    microsecond=0
+                )
+            except Exception:
+                return None
+
+        start_str = cam.get('schedule_start') or '00:00:00'
+        end_str   = cam.get('schedule_end')   or '23:59:59'
+        start_dt  = parse_time(start_str)
+        end_dt    = parse_time(end_str)
+
+        if start_dt and end_dt:
+            return start_dt <= now_brt <= end_dt
+        return True  # Fail-open if parse fails
+
+    def _update_active_streams(self, cameras_map: dict):
+        """Rewrite active_streams.json with hashes of cameras currently in-schedule.
+
+        - Cameras within their operating window: hash included → RTMP ACCEPTED
+        - Cameras outside window / ai_enabled=False: hash excluded → RTMP REJECTED
+        - Empty list [] would mean allow-all; we never write that — we write the
+          explicit list of active hashes so the RTMP server always enforces it.
+        """
+        active_hashes: List[str] = []
+
+        for cam in cameras_map.values():
+            stream_url: str = cam.get('stream_url', '') or ''
+            if not stream_url:
+                continue
+
+            # Extract hash from rtmp://…/live/<hash>
+            parts = stream_url.rstrip('/').split('/')
+            stream_hash = parts[-1] if parts else ''
+            if len(stream_hash) != 48:
+                continue  # Not a valid hash — skip
+
+            if self._is_camera_active(cam):
+                active_hashes.append(stream_hash)
+
+        try:
+            os.makedirs(os.path.dirname(ACTIVE_STREAMS_PATH), exist_ok=True)
+            with open(ACTIVE_STREAMS_PATH, 'w') as f:
+                json.dump(active_hashes, f, indent=2)
+            logger.info(
+                f"📋 active_streams.json atualizado: {len(active_hashes)} câmera(s) ativas "
+                f"[BRT {datetime.now(BRASILIA_TZ).strftime('%H:%M')}]"
+            )
+        except Exception as e:
+            logger.error(f"Falha ao gravar active_streams.json: {e}")

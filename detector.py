@@ -1,460 +1,569 @@
-    
+"""
+detector.py — Mac-adapted Camera Detector
+Uses YOLOv8 with CPU inference, ByteTrack tracking, and line crossing detection.
+HLS streams are captured via subprocess ffmpeg (Mac ARM OpenCV lacks HLS support).
+"""
 import time
 import logging
+import subprocess
 import cv2
 import threading
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 import supervision as sv
 from ultralytics import YOLO
 import numpy as np
 import asyncio
+import os
 
 from api_client import APIClient
-from tracker import Tracker
-# from line_counter import LineCounter # Deprecated
 from line_crossing import LineCrossingDetector, CountingLine
 from zone_monitor import ZoneMonitor
-from face_analyzer import FaceAnalyzer
+from demographics import DemographicsAnalyzer
 
 logger = logging.getLogger(__name__)
 
+
 class CameraDetector(threading.Thread):
     def __init__(self, camera_config: Dict[str, Any], api_client: APIClient):
-        super().__init__()
+        super().__init__(daemon=True)
         self.config = camera_config
         self.api_client = api_client
         self.running = False
         self.camera_id = self.config['id']
-        self.source = self.config['stream_url']
-        # Support for local USB cameras (index 0, 1, etc.)
+
+        raw_url = self.config.get('stream_url', '')
+        if isinstance(raw_url, str):
+            raw_url = raw_url.strip()
+
+            if raw_url.startswith("rtmp://"):
+                # Always rewrite the host to 127.0.0.1 so each server reads
+                # from its own local RTMP server (port 55935), regardless of
+                # which IP is stored in the database.
+                import re as _re
+                # Extract just the /live/{hash} path
+                match = _re.search(r'(rtmp://)[^/]+(/.+)', raw_url)
+                if match:
+                    path = match.group(2)
+                    # Normalize port: replace :1935 with :55935 if present
+                    self.source = f"rtmp://127.0.0.1:55935{path}"
+                else:
+                    self.source = raw_url.replace("localhost:1935", "localhost:55935")
+            elif raw_url.startswith("/live/") or ("live/" in raw_url and not raw_url.startswith(("http", "rtsp://"))):
+                self.source = f"rtmp://127.0.0.1:55935{raw_url if raw_url.startswith('/') else '/' + raw_url}"
+            else:
+                # Non-RTMP source (HLS, file, webcam) — use as-is
+                self.source = raw_url
+        else:
+            self.source = raw_url
+
         if isinstance(self.source, str) and self.source.isdigit():
             self.source = int(self.source)
-        
+
         self.model_name = self.config.get('model', 'yolov8n.pt')
-        self.conf_threshold = self.config.get('confidence_threshold', 0.5)
-        self.target_classes = self.config.get('classes', [0]) # Default to person
-        
+        self.conf_threshold = self.config.get('confidence_threshold', 0.4)
+        self.target_classes = self.config.get('classes', [0])
+        self.inference_size = self.config.get('inference_size', 640)
+
         logger.info(f"Initializing CameraDetector for {self.camera_id}...")
-        
-        # Initialize YOLO
-        try:
-            self.model = YOLO(self.model_name)
-            logger.info(f"YOLO model '{self.model_name}' loaded successfully.")
-        except Exception as e:
-            logger.critical(f"Failed to load YOLO model: {e}")
-            raise
 
-        # Initialize Tracker
-        try:
-            fps = self.config.get('fps', 30)
-            self.tracker = sv.ByteTrack(frame_rate=fps)
-            logger.info(f"ByteTrack initialized with frame_rate={fps}")
-        except Exception as e:
-            logger.critical(f"Failed to initialize ByteTrack: {e}")
-            raise
+        # Load YOLO model (.pt supports dynamic inference sizes)
+        self.model = YOLO(self.model_name, task='detect')
+        logger.info(f"🚀 YOLO model '{self.model_name}' loaded (inference_size={self.inference_size})")
 
-        # Initialize Line Crossing Detector (New)
+        # ByteTrack
+        fps = self.config.get('fps', 5)
+        sv_ver = tuple(map(int, sv.__version__.split('.')[:2]))
+        if sv_ver >= (0, 22):
+            self.tracker = sv.ByteTrack(
+                frame_rate=fps,
+                track_activation_threshold=0.03,
+                minimum_matching_threshold=0.95,
+                lost_track_buffer=150
+            )
+        else:
+            self.tracker = sv.ByteTrack(
+                frame_rate=fps,
+                track_thresh=0.03,
+                match_thresh=0.95,
+                track_buffer=150
+            )
+
+        # Line Crossing
         self.crossing_detector = LineCrossingDetector()
         self.counting_lines: List[CountingLine] = []
 
-        # Initialize Zone Monitor (New)
-        self.zone_monitor: Optional[ZoneMonitor] = None
-        self.zones_config = self.config.get('zones', []) # List of zones from config
+        # Dwell Time Zones
+        self.zone_monitor = ZoneMonitor()
 
-        # Initialize Face Analyzer (New - Demographics)
-        self.face_analyzer = FaceAnalyzer()
-        # Cache for demographics: {track_id: {'age': ..., 'gender': ...}}
-        self.demographics_cache: Dict[str, Dict[str, Any]] = {}
-        # We can trigger model load in background to avoid stall on first frame
-        threading.Thread(target=self.face_analyzer.load_models, daemon=True).start()
-        
-        # State for dynamic resolution handling
+        # Demographics (gender + age estimation)
+        # ENABLE_DEMOGRAPHICS env var overrides Supabase config — set to 'false'
+        # in ecosystem.config.cjs to prevent InsightFace from loading on servers
+        # where demographics cause C++ crashes (simultaneous model instances).
+        env_demo = os.environ.get('ENABLE_DEMOGRAPHICS', '').lower()
+        if env_demo == 'false':
+            demographics_enabled = False
+        else: # 'true' or missing means we obey Supabase's config (which defaults to False)
+            demographics_enabled = bool(self.config.get('demographics_enabled', False))
+        self.demographics = DemographicsAnalyzer(enabled=demographics_enabled)
+
+        # State
         self.raw_rois: List[Dict] = []
         self.current_resolution: Optional[Tuple[int, int]] = None
-        
-        # Line Counters are now managed by ROI Sync & Dynamic Resolution
-        # We skip local config reading here.
         self.roi_id = self.config.get('roi_id')
-        
+
         # Telemetry
         self.fps_monitor = sv.FPSMonitor()
+        self._fps_val = 0.0
         self.frame_count = 0
-        
-        # Stream Output
+        self.detection_count = 0
+
+        # Stream output
         self.latest_frame: Optional[np.ndarray] = None
         self.lock = threading.Lock()
 
         # Annotators
         self.box_annotator = sv.BoxAnnotator()
-        self.label_annotator = sv.LabelAnnotator()
         self.trace_annotator = sv.TraceAnnotator()
-        self.line_zone_annotator = sv.LineZoneAnnotator()
+        try:
+            self.label_annotator = sv.LabelAnnotator()
+        except AttributeError:
+            self.label_annotator = None
+
+    # ----- Stream helpers -----
+
+    def _is_network_stream(self) -> bool:
+        return isinstance(self.source, str) and (
+            self.source.startswith('http') or self.source.startswith('rtsp') or self.source.startswith('rtmp')
+        )
+
+    def _probe_resolution(self) -> Tuple[int, int]:
+        try:
+            result = subprocess.run([
+                'ffprobe', '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=width,height',
+                '-of', 'csv=p=0:s=x',
+                self.source
+            ], capture_output=True, text=True, timeout=15)
+            parts = result.stdout.strip().split('x')
+            if len(parts) == 2:
+                return int(parts[0]), int(parts[1])
+        except Exception as e:
+            logger.warning(f"ffprobe failed: {e}")
+        return 1280, 720
+
+    def _start_ffmpeg(self, width: int, height: int):
+        target_fps = min(self.config.get('fps', 5), 5)  # Cap at 5 FPS — YOLO/CPU limit
+        # Decode resolution: env var > camera config > default 960x540
+        dec_w = int(os.environ.get('DECODE_WIDTH', self.config.get('decode_width', 960)))
+        dec_h = int(os.environ.get('DECODE_HEIGHT', self.config.get('decode_height', 540)))
+        is_rtmp = isinstance(self.source, str) and self.source.startswith('rtmp://')
+
+        if is_rtmp:
+            cmd = [
+                'ffmpeg',
+                '-loglevel', 'warning',
+                '-rtmp_live', 'live',
+                '-i', str(self.source),
+                '-map', '0:v:0',
+                '-an',
+                '-vf', f'scale={dec_w}:{dec_h}:flags=fast_bilinear',
+                f'-s', f'{dec_w}x{dec_h}',
+                '-r', str(target_fps),
+                '-f', 'rawvideo',
+                '-pix_fmt', 'bgr24',
+                'pipe:1'
+            ]
+        else:
+            cmd = [
+                'ffmpeg',
+                '-loglevel', 'warning',
+                '-analyzeduration', '10000000',
+                '-probesize', '10000000',
+                '-reconnect', '1',
+                '-reconnect_streamed', '1',
+                '-reconnect_delay_max', '5',
+                '-i', str(self.source),
+                '-map', '0:v:0',
+                '-an',
+                '-vf', f'scale={dec_w}:{dec_h}:flags=fast_bilinear',
+                f'-s', f'{dec_w}x{dec_h}',
+                '-r', str(target_fps),
+                '-f', 'rawvideo',
+                '-pix_fmt', 'bgr24',
+                'pipe:1'
+            ]
+        frame_bytes = dec_w * dec_h * 3
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                bufsize=frame_bytes * 2)
+
+
+    # ----- Main loop -----
 
     def run(self):
-        logger.info(f"Starting detection loop for camera {self.camera_id} source={self.source}")
+        logger.info(f"🎬 Starting detection loop for {self.config.get('name', self.camera_id)}")
+        logger.info(f"   Source: {self.source}")
         self.running = True
-        
+
         while self.running:
             try:
-                cap = cv2.VideoCapture(self.source)
-                if not cap.isOpened():
-                    logger.error(f"Failed to open stream for {self.camera_id}. Retrying in 5s...")
-                    time.sleep(5)
-                    continue
-                
-                logger.info(f"Successfully connected to stream: {self.source}")
-                
-                 # Optimization for Live Streams (Low Latency)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                
-                # Note: For strict timeout handling with FFMPEG backend, 
-                # strictly speaking one should set os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "timeout;5000"
-                # in main.py before loading cv2, but behavior varies by version.
-                # The generic reconnection loop below handles 'hard' drops effectively.
-                
-                while self.running:
-                    ret, frame = cap.read()
-                    if not ret:
-                        # Stream ended or Connection Lost logic
-                        # Stream ended or Connection Lost logic
-                        # If it's a file (mp4), we seek to 0.
-                        # If it's a stream (rtsp/hls), seeking usually doesn't work or throws error.
-                        
-                        is_local_file = isinstance(self.source, str) and not (self.source.startswith('http') or self.source.startswith('rtsp'))
-                        
-                        if is_local_file:
-                            logger.info(f"File end reached for {self.camera_id}. Looping...")
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                            
-                            # RESET TRACKING STATE ON LOOP RESTART
-                            # This is critical so that objects are re-counted as new people in the next loop.
-                            try:
-                                fps = self.config.get('fps', 30)
-                                self.tracker = sv.ByteTrack(frame_rate=fps)
-                                # Preserve existing counting lines but clear crossing state
-                                current_lines = self.counting_lines 
-                                self.crossing_detector = LineCrossingDetector()
-                                # No need to re-add lines, just pass them in update()
-                                logger.info("Tracker and Crossing Detector reset for loop.")
-                            except Exception as e:
-                                logger.error(f"Error resetting tracker on loop: {e}")
-
-                            ret, frame = cap.read()
-                        
-                        if not ret:
-                            # If loop failed OR it is a stream (HLS/RTSP) that ended/broke
-                            logger.warning(f"Stream {self.camera_id} ended or failed. Reconnecting in 2s...")
-                            break # Break inner loop to re-initialize VideoCapture in outer loop
-                    
-                    self.frame_count += 1
-                    self.fps_monitor.tick()
-                    
-                    # -------------------------------------------------------------
-                    # DYNAMIC RESOLUTION CHECK
-                    # Ensure counting lines match current video geometry
-                    # -------------------------------------------------------------
-                    height, width = frame.shape[:2]
-                    if self.current_resolution != (width, height):
-                        # Resolution changed or initial frame
-                        self._rebuild_lines(width, height)
-                        self._rebuild_zones(width, height)
-                    
-                    # Inference
-                    results = self.model(frame, verbose=False, conf=self.conf_threshold)[0]
-                    detections = sv.Detections.from_ultralytics(results)
-                    
-                    # Filter classes
-                    if self.target_classes:
-                        # Ensure classes are integers
-                        target_classes_int = [int(c) for c in self.target_classes]
-                        detections = detections[np.isin(detections.class_id, target_classes_int)]
-
-                    # Update Tracker
-                    detections = self.tracker.update_with_detections(detections)
-                    
-                    # Track Active IDs for cleanup
-                    active_track_ids = set()
-                    
-                    # Annotation Preparation
-                    annotated_frame = frame.copy()
-                    
-                    # ... (Annotation logic omitted for brevity if unchanged, but included below for context) ...
-                    # Draw Traces
-                    annotated_frame = self.trace_annotator.annotate(
-                        scene=annotated_frame, detections=detections
-                    )
-                    # Draw Boxes
-                    annotated_frame = self.box_annotator.annotate(
-                        scene=annotated_frame, detections=detections
-                    )
-
-                    # Process Detections & Events for API
-                    if detections.tracker_id is not None:
-                        
-                        for i, track_id in enumerate(detections.tracker_id):
-                            str_track_id = str(track_id)
-                            active_track_ids.add(str_track_id)
-                            
-                            # Extract BBox
-                            x1, y1, x2, y2 = detections.xyxy[i]
-                            bbox = {
-                                "x": int(x1),
-                                "y": int(y1),
-                                "width": int(x2 - x1),
-                                "height": int(y2 - y1)
-                            }
-                            
-                            # Check Crossings
-                            crossings = self.crossing_detector.update(
-                                track_id=str_track_id,
-                                bbox=bbox,
-                                lines=self.counting_lines
-                            )
-                            
-                            # ANALYTICS: Demographics (Age/Gender)
-                            # Only for Person class (0) and if not already analyzed
-                            demographics = {}
-                            if int(detections.class_id[i]) == 0: # 0 is person in COCO
-                                if str_track_id in self.demographics_cache:
-                                    demographics = self.demographics_cache[str_track_id]
-                                else:
-                                    # Analyze new track
-                                    # We should only analyze if confidence is good and face likely visible
-                                    if detections.confidence[i] > 0.6: 
-                                        analysis = self.face_analyzer.detect_and_analyze(frame, bbox)
-                                        if analysis:
-                                            self.demographics_cache[str_track_id] = analysis
-                                            demographics = analysis
-                                            logger.info(f"Demographics for {str_track_id}: {analysis['age']}, {analysis['gender']}")
-
-                            # ANALYTICS: Dwell Time
-                            # Zone events are bulk processed, but we can also attach "current zone" info to payload if needed.
-                            # For now, Dwell Time events are sent SEPARATELY below.
-                            
-                            # Prepare Payload
-                            detection_payload = {
-                                "camera_id": self.camera_id,
-                                "timestamp": datetime.utcnow().isoformat() + "Z", # UTC ISO8601
-                                "detection_class": self.model.names[detections.class_id[i]],
-                                "confidence": float(detections.confidence[i]),
-                                "track_id": str_track_id,
-                                "bounding_box": bbox,
-                                "roi_id": None,
-                                "crossed_line": False,
-                                "direction": None,
-                                "age": demographics.get("age"),
-                                "gender": demographics.get("gender"),
-                                "dwell_time": None # populated only for zone_exit events
-                            }
-                            
-                            # If crossed, update payload
-                            # Note: A single track might cross multiple lines in one frame (rare but possible).
-                            # API usually expects one event per object per frame.
-                            # We pick the first crossing event to report, or we need to send multiple.
-                            # Assuming 1 event for now.
-                            if crossings:
-                                crossing = crossings[0]
-                                detection_payload.update({
-                                    "crossed_line": True,
-                                    "roi_id": crossing['roi_id'],
-                                    "direction": crossing['direction']
-                                })
-                                logger.info(f"CROSSING: {str_track_id} -> {crossing['direction']} on {crossing['roi_id']}")
-                            
-                            # Send to API Client ONLY if line crossed (Optimization for Counting)
-                            if self.api_client and detection_payload["crossed_line"]:
-                                if not self.api_client.loop or self.api_client.loop.is_closed():
-                                    logger.error(f"API Client loop is closed or missing. Cannot send detection.")
-                                    continue
-                                
-                                logger.info(f"Triggering API send for track {str_track_id} (Loop: {self.api_client.loop})")
-                                try:
-                                    future = asyncio.run_coroutine_threadsafe(
-                                        self.api_client.add_detection(detection_payload),
-                                        self.api_client.loop
-                                    )
-                                    # Optional: Add callback to log exceptions from the coroutine
-                                    def handle_future_result(f):
-                                        try:
-                                            f.result()
-                                        except Exception as e:
-                                            logger.error(f"Error in scheduled API call: {e}")
-                                            
-                                    future.add_done_callback(handle_future_result)
-                                except Exception as e:
-                                    logger.error(f"Failed to schedule API call: {e}")
-
-                    # -------------------------------------------------------------
-                    # PROCESS ZONE EVENTS (Dwell Time)
-                    # -------------------------------------------------------------
-                    if self.zone_monitor:
-                        zone_events = self.zone_monitor.update(detections)
-                        for event in zone_events:
-                            # event: {type, zone_id, track_id, dwell_time, action}
-                            
-                            # Create a specialized payload for Dwell Event
-                            # Or reuse standard payload?
-                            # Let's create a standard payload marked as "dwell_event"
-                            
-                            # We need class/confidence? we might not have it easily for "exited" tracks
-                            # unless we cache it. For now, sending what we have.
-                            
-                            dwell_payload = {
-                                "camera_id": self.camera_id,
-                                "timestamp": datetime.utcnow().isoformat() + "Z",
-                                "track_id": event["track_id"],
-                                "roi_id": event["zone_id"], # Zone ID
-                                "event_type": "dwell",
-                                "dwell_time": event["dwell_time"],
-                                "action": event["action"], # "exit"
-                                # Enriched with cached demographics if available
-                                "age": self.demographics_cache.get(event["track_id"], {}).get("age"),
-                                "gender": self.demographics_cache.get(event["track_id"], {}).get("gender"),
-                            }
-                            
-                            if self.api_client:
-                                logger.info(f"DWELL EVENT: Track {event['track_id']} spent {event['dwell_time']}s in {event['zone_id']}")
-                                try:
-                                    asyncio.run_coroutine_threadsafe(
-                                        self.api_client.add_detection(dwell_payload),
-                                        self.api_client.loop
-                                    )
-                                except Exception as e:
-                                    logger.error(f"Failed to emit dwell event: {e}")
-                    # Cleanup stale tracks from crossing detector
-                    self.crossing_detector.cleanup_stale_tracks(active_track_ids)
-
-                    # Draw Lines (Visual Aid)
-                    # We can use LineZoneAnnotator for visualization if we map CountingLine back to LineZone
-                    # Or just draw lines manually using cv2
-                    for line in self.counting_lines:
-                         cv2.line(annotated_frame, 
-                                  (int(line.p1[0]), int(line.p1[1])), 
-                                  (int(line.p2[0]), int(line.p2[1])), 
-                                  (0, 255, 0), 2)
-                         # Draw normal vector to show direction
-                         center = ((line.p1[0] + line.p2[0])/2, (line.p1[1] + line.p2[1])/2)
-                         # normal is normalized, scale it for display
-                         end_n = (center[0] + line._normal[0]*20, center[1] + line._normal[1]*20)
-                         cv2.arrowedLine(annotated_frame, 
-                                         (int(center[0]), int(center[1])), 
-                                         (int(end_n[0]), int(end_n[1])), 
-                                         (0, 0, 255), 1)
-
-                    # Update Shared Frame safely
-                    with self.lock:
-                        self.latest_frame = annotated_frame
-                        
-                cap.release()
-                
+                if self._is_network_stream():
+                    self._run_ffmpeg_capture()
+                else:
+                    self._run_cv2_capture()
             except Exception as e:
-                logger.error(f"Error in camera loop {self.camera_id}: {e}")
+                logger.error(f"Error in camera loop: {e}")
                 time.sleep(5)
-    
-    def update_settings(self, rois: List[Dict[str, Any]], camera_config: Dict[str, Any]):
-        """
-        Updates camera settings (Counting Lines, Confidence, Classes) dynamically.
-        """
-        logger.info(f"Updating settings for camera {self.camera_id}")
+
+    def _run_ffmpeg_capture(self):
+        """Capture via subprocess ffmpeg (HLS/HTTP/RTSP)."""
+        import threading
+        width, height = self._probe_resolution()
+        logger.info(f"📐 Stream resolution: {width}x{height}")
+
+        proc = self._start_ffmpeg(width, height)
+        logger.info(f"✅ ffmpeg started for stream capture")
+
+        dec_w = int(os.environ.get('DECODE_WIDTH', self.config.get('decode_width', 960)))
+        dec_h = int(os.environ.get('DECODE_HEIGHT', self.config.get('decode_height', 540)))
+        frame_size = dec_w * dec_h * 3
+        shared_state = {"frame": None, "running": True, "error": False}
+
+        def _reader_thread():
+            try:
+                while self.running and shared_state["running"]:
+                    raw = b''
+                    while len(raw) < frame_size:
+                        chunk = proc.stdout.read(frame_size - len(raw))
+                        if not chunk:
+                            break
+                        raw += chunk
+
+                    if len(raw) != frame_size:
+                        shared_state["error"] = True
+                        break
+
+                    # Store latest frame at fixed 640x360 for AI
+                    shared_state["frame"] = np.frombuffer(raw, dtype=np.uint8).reshape((dec_h, dec_w, 3))
+            except Exception as e:
+                logger.error(f"FFmpeg reader thread error: {e}")
+                shared_state["error"] = True
+            finally:
+                shared_state["running"] = False
+
+        thread = threading.Thread(target=_reader_thread, daemon=True)
+        thread.start()
+
+        try:
+            while self.running:
+                if shared_state["error"]:
+                    break
+                
+                frame = shared_state["frame"]
+                if frame is not None:
+                    shared_state["frame"] = None  # Consume frame
+                    self._process_frame(frame, dec_w, dec_h)
+                else:
+                    time.sleep(0.01)
+
+        finally:
+            shared_state["running"] = False
+            proc.kill()
+            proc.wait()
+            is_mp4 = isinstance(self.source, str) and self.source.lower().split("?")[0].endswith(".mp4")
+            delay = 0.1 if is_mp4 else 5
+            logger.info(f"ffmpeg terminated. Reconnecting in {delay}s...")
+            time.sleep(delay)
+
+    def _run_cv2_capture(self):
+        """Capture via OpenCV (local files, webcam)."""
+        cap = cv2.VideoCapture(self.source)
+        if not cap.isOpened():
+            logger.error("Failed to open local source. Retrying in 5s...")
+            time.sleep(5)
+            return
+
+        logger.info("✅ Connected to local source")
+        target_fps = self.config.get('fps', 5)
+        frame_interval = max(1, int(30 / target_fps))
+        frame_idx = 0
+
+        while self.running:
+            ret, frame = cap.read()
+            if not ret:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                sv_ver = tuple(map(int, sv.__version__.split('.')[:2]))
+                if sv_ver >= (0, 22):
+                    self.tracker = sv.ByteTrack(
+                        frame_rate=target_fps,
+                        track_activation_threshold=0.10,
+                        minimum_matching_threshold=0.9
+                    )
+                else:
+                    self.tracker = sv.ByteTrack(
+                        frame_rate=target_fps,
+                        track_thresh=0.10,
+                        match_thresh=0.9
+                    )
+                self.crossing_detector = LineCrossingDetector()
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+            frame_idx += 1
+            if frame_idx % frame_interval != 0:
+                continue
+
+            h, w = frame.shape[:2]
+            self._process_frame(frame, w, h)
+
+        cap.release()
+
+    # ----- Core processing -----
+
+    def _process_frame(self, frame: np.ndarray, width: int, height: int):
+        """Run YOLO + tracking + line crossing on a single frame."""
+        self.frame_count += 1
+        self.fps_monitor.tick()
+
+        if self.current_resolution != (width, height):
+            self._rebuild_lines(width, height)
+
+        # YOLO inference
+        results = self.model(
+            frame, 
+            verbose=False, 
+            conf=self.conf_threshold, 
+            iou=0.40, 
+            imgsz=self.inference_size
+        )[0]
+        detections = sv.Detections.from_ultralytics(results)
+
+        if self.target_classes:
+            target_int = [int(c) for c in self.target_classes]
+            detections = detections[np.isin(detections.class_id, target_int)]
+
+        detections = self.tracker.update_with_detections(detections)
+
+        active_track_ids = set()
+        annotated = frame.copy()
         
-        # 1. Update Detection Params
+        labels = []
+        for i in range(len(detections)):
+            class_id = detections.class_id[i]
+            tracker_id = detections.tracker_id[i] if detections.tracker_id is not None else ""
+            conf = detections.confidence[i]
+            class_name = self.model.names.get(class_id, f"class_{class_id}")
+            lbl = f"{class_name} {conf:.2f}"
+            if tracker_id:
+                lbl = f"#{tracker_id} {lbl}"
+            labels.append(lbl)
+
+        annotated = self.trace_annotator.annotate(scene=annotated, detections=detections)
+        if getattr(self, "label_annotator", None):
+            annotated = self.box_annotator.annotate(scene=annotated, detections=detections)
+            annotated = self.label_annotator.annotate(scene=annotated, detections=detections, labels=labels)
+        else:
+            try:
+                annotated = self.box_annotator.annotate(scene=annotated, detections=detections, labels=labels)
+            except TypeError:
+                annotated = self.box_annotator.annotate(scene=annotated, detections=detections)
+
+        # Process each detection
+        if detections.tracker_id is not None:
+            for i, track_id in enumerate(detections.tracker_id):
+                tid = str(track_id)
+                active_track_ids.add(tid)
+
+                x1, y1, x2, y2 = detections.xyxy[i]
+                bbox = {"x": int(x1), "y": int(y1), "width": int(x2-x1), "height": int(y2-y1)}
+
+                crossings = self.crossing_detector.update(track_id=tid, bbox=bbox, lines=self.counting_lines)
+
+                class_id = int(detections.class_id[i])
+                class_name = self.model.names.get(class_id, f"class_{class_id}")
+
+                # Demographics: analyze face for gender/age (persons only)
+                # Falls back to last-known result so crossings still carry
+                # demographic data even when face isn't visible in this frame.
+                demo_data = None
+                if class_name == "person":
+                    demo_data = self.demographics.analyze(frame, tid, bbox)
+                    if demo_data is None:
+                        demo_data = self.demographics.get_last_known(tid)
+
+                if crossings:
+                    crossing = crossings[0]
+                    self.detection_count += 1
+                    demo_label = ""
+                    if demo_data:
+                        demo_label = f" [{demo_data['gender']}, {demo_data['age']}]"
+                    logger.info(f"🚶 CROSSING: {class_name} #{tid} → {crossing['direction']}{demo_label}")
+
+                    payload = {
+                        "camera_id": self.camera_id,
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "detection_class": class_name,
+                        "confidence": float(detections.confidence[i]),
+                        "track_id": tid,
+                        "bounding_box": bbox,
+                        "roi_id": crossing['roi_id'],
+                        "crossed_line": True,
+                        "direction": crossing['direction'],
+                    }
+
+                    # Attach demographics if available
+                    if demo_data:
+                        payload["gender"] = demo_data["gender"]
+                        payload["age"] = demo_data["age"]
+
+                    if self.api_client and self.api_client.loop and not self.api_client.loop.is_closed():
+                        try:
+                            asyncio.run_coroutine_threadsafe(
+                                self.api_client.add_detection(payload),
+                                self.api_client.loop
+                            )
+                        except Exception as e:
+                            logger.error(f"API call error: {e}")
+
+        self.crossing_detector.cleanup_stale_tracks(active_track_ids)
+
+        # Process dwell time zones
+        dwell_events = self.zone_monitor.update(detections)
+        for evt in dwell_events:
+            class_id = evt.get("class_id", 0)
+            class_name = self.model.names.get(class_id, f"class_{class_id}")
+            payload = {
+                "camera_id": self.camera_id,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "detection_class": class_name,
+                "confidence": evt.get("confidence", 0.5),
+                "track_id": evt["track_id"],
+                "roi_id": evt["roi_id"],
+                "crossed_line": False,
+                "direction": None,
+                "dwell_time_seconds": evt["dwell_time"],
+            }
+
+            # Attach demographics for dwell events (persons only)
+            if class_name == "person":
+                dwell_demo = self.demographics.analyze(
+                    frame, evt["track_id"],
+                    {"x": 0, "y": 0, "width": width, "height": height}  # fallback bbox
+                )
+                if dwell_demo:
+                    payload["gender"] = dwell_demo["gender"]
+                    payload["age"] = dwell_demo["age"]
+
+            if self.api_client and self.api_client.loop and not self.api_client.loop.is_closed():
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self.api_client.add_detection(payload),
+                        self.api_client.loop
+                    )
+                except Exception as e:
+                    logger.error(f"Dwell API call error: {e}")
+
+        # Draw dwell zones
+        for zone in self.zone_monitor.zones:
+            pts = zone.polygon.reshape((-1, 1, 2))
+            cv2.polylines(annotated, [pts], True, (255, 200, 0), 2)
+            count = len(zone.current_objects)
+            if count > 0:
+                cx = int(zone.polygon[:, 0].mean())
+                cy = int(zone.polygon[:, 1].mean())
+                cv2.putText(annotated, f"{zone.name}: {count}",
+                            (cx - 30, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 2)
+
+        # Draw counting lines / polylines (all N-1 segments)
+        for line in self.counting_lines:
+            pts = [(int(p[0]), int(p[1])) for p in line.points]
+            for i in range(len(pts) - 1):
+                cv2.line(annotated, pts[i], pts[i + 1], (0, 255, 0), 2)
+            # Vertex dots for polylines with more than 2 points
+            if len(pts) > 2:
+                for pt in pts[1:-1]:
+                    cv2.circle(annotated, pt, 5, (0, 200, 0), -1)
+
+        try:
+            fps_val = self.fps_monitor() if callable(self.fps_monitor) else self.fps_monitor.fps
+        except Exception:
+            fps_val = self._fps_val
+        self._fps_val = fps_val
+        cv2.putText(annotated, f"FPS: {fps_val:.1f} | Det: {self.detection_count}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        # Upscale 960x540 → 1280x720 para preview na porta 8765
+        preview = cv2.resize(annotated, (1280, 720), interpolation=cv2.INTER_LINEAR)
+        with self.lock:
+            self.latest_frame = preview
+
+        # Log periodically
+        if self.frame_count % 50 == 0:
+            logger.info(f"📊 Frames: {self.frame_count} | FPS: {fps_val:.1f} | Crossings: {self.detection_count}")
+
+    # ----- Settings -----
+
+    def update_settings(self, rois: List[Dict[str, Any]], camera_config: Dict[str, Any]):
+        logger.info(f"Updating settings for camera {self.camera_id}")
         if camera_config:
             new_conf = camera_config.get('confidence_threshold')
             if new_conf:
                 self.conf_threshold = float(new_conf)
-            
             new_classes = camera_config.get('enabled_classes')
-            if new_classes:
-                # Map class names to IDs... (same logic as before)
+            if new_classes and hasattr(self.model, 'names'):
                 target_ints = []
                 name_to_id = {v: k for k, v in self.model.names.items()}
                 for c in new_classes:
                     if isinstance(c, int):
                         target_ints.append(c)
-                    elif isinstance(c, str):
-                        if c in name_to_id:
-                            target_ints.append(name_to_id[c])
+                    elif isinstance(c, str) and c in name_to_id:
+                        target_ints.append(name_to_id[c])
                 self.target_classes = target_ints
-                
-        # 2. Store Raw ROIs for Dynamic Resolution Handling
-        # We process them only when we know the frame resolution in the run loop.
+
+            # Demographics toggle is now fully handled by config_sync fingerprint,
+            # which will trigger a clean thread restart if changed.
+
         with self.lock:
             self.raw_rois = rois
-            # Force rebuild lines on next frame check
-            self.current_resolution = None 
+            self.current_resolution = None
 
     def _rebuild_lines(self, width: int, height: int):
-        """Rebuilds CountingLine objects with specific resolution."""
         if not self.raw_rois:
             self.counting_lines = []
+            self.zone_monitor.rebuild_zones([], width, height)
+            self.current_resolution = (width, height)
             return
-
-        logger.info(f"Rebuilding counting lines for resolution {width}x{height}...")
+        logger.info(f"Rebuilding counting lines & dwell zones for {width}x{height}...")
         try:
-            new_lines = []
-            for roi in self.raw_rois:
-                # Assuming roi_sync passes clean dicts
-                line = CountingLine.from_roi(roi, width, height)
-                if line:
-                   new_lines.append(line)
-            
-            self.counting_lines = new_lines
+            new_lines = [CountingLine.from_roi(r, width, height) for r in self.raw_rois]
+            self.counting_lines = [l for l in new_lines if l]
             self.current_resolution = (width, height)
             logger.info(f"Active counting lines: {len(self.counting_lines)}")
-            
         except Exception as e:
             logger.error(f"Failed to rebuild lines: {e}")
+        try:
+            self.zone_monitor.rebuild_zones(self.raw_rois, width, height)
+        except Exception as e:
+            logger.error(f"Failed to rebuild dwell zones: {e}")
 
     def stop(self):
         self.running = False
-        # Do not join explicitly if called from signal handler to avoid deadlock, 
-        # but here it's fine.
-    
+
     def get_latest_frame(self):
         with self.lock:
-            if self.latest_frame is None:
-                return None
-            return self.latest_frame.copy()
+            return self.latest_frame.copy() if self.latest_frame is not None else None
 
     def get_status(self):
         return {
             "id": self.camera_id,
-            "fps": self.fps_monitor.fps,
+            "name": self.config.get('name', self.camera_id),
+            "fps": self._fps_val,
             "frames_processed": self.frame_count,
+            "detections_sent": self.detection_count,
             "running": self.running,
             "resolution": self.current_resolution,
             "active_lines": len(self.counting_lines),
-            "active_zones": len(self.zone_monitor.zones) if self.zone_monitor else 0
+            "demographics": self.demographics.get_stats(),
         }
-
-    def _rebuild_zones(self, width: int, height: int):
-        """Re-initializes ZoneMonitor with current resolution."""
-        # Clean current monitor
-        self.zone_monitor = ZoneMonitor((width, height))
-        
-        for z_conf in self.zones_config:
-            # Config format: points: [[x,y], [x,y]...] (Normalized preferably, but user config might be pixels)
-            # Config example: points: [[100, 100], [200, 100], ...]
-            # Let's assume Pixel Coordinates if numbers > 1, else Normalized.
-            
-            raw_points = z_conf.get('points', [])
-            if not raw_points:
-                continue
-                
-            final_points = []
-            for p in raw_points:
-                x, y = p
-                # Check if normalized
-                if 0 <= x <= 1 and 0 <= y <= 1 and isinstance(x, float):
-                    final_points.append([int(x * width), int(y * height)])
-                else:
-                    final_points.append([int(x), int(y)])
-            
-            self.zone_monitor.add_zone(
-                pool_id=z_conf.get('id', 'unknown_zone'),
-                name=z_conf.get('name', 'Zone'),
-                polygon_points=final_points
-            )
-        
-        logger.info(f"Rebuilt {len(self.zone_monitor.zones)} zones for resolution {width}x{height}")
