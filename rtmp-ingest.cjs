@@ -136,9 +136,41 @@ const snapServer = http.createServer((req, res) => {
     return;
   }
 
+  // ── Snapshot on demand: POST /snapshot-now/:streamKey ────────
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.writeHead(204); res.end(); return;
+  }
+
+  if (req.method === 'POST' && p.startsWith('/snapshot-now/')) {
+    const streamKey = path.basename(p);
+    if (!streamKey) { res.writeHead(400); res.end('Missing streamKey'); return; }
+    const rtmpUrl  = `rtmp://127.0.0.1:55935/live/${streamKey}`;
+    const outFile  = path.join(SNAP_DIR, `${streamKey}.jpg`);
+    console.log(`[RTMP] Snapshot solicitado para: ${streamKey}`);
+    execFile('ffmpeg', [
+      '-y', '-i', rtmpUrl,
+      '-frames:v', '1', '-q:v', '3',
+      outFile,
+    ], { timeout: 10000 }, (err) => {
+      if (err) {
+        console.error(`[RTMP] Snapshot error: ${err.message}`);
+        res.writeHead(502);
+        res.end(JSON.stringify({ error: err.message }));
+      } else {
+        console.log(`[RTMP] Snapshot salvo: ${outFile}`);
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ ok: true, key: streamKey }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
+
 
 // ─── Start ───────────────────────────────────────────────────────────────────
 nms.run();
