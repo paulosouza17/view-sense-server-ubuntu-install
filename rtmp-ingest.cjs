@@ -40,21 +40,10 @@ const nmsConfig = {
     mediaroot: MEDIA_ROOT,
     allow_origin: '*',
   },
-  trans: {
-    ffmpeg: process.env.FFMPEG_PATH || '/usr/bin/ffmpeg',
-    tasks: [
-      {
-        app: 'live',
-        hls: true,
-        hlsFlags: '[hls_time=2:hls_list_size=6:hls_flags=delete_segments]',
-        hlsKeep: false,
-        dash: false,
-      },
-    ],
-  },
 };
 
 const nms = new NodeMediaServer(nmsConfig);
+const hlsProcesses = {};
 
 // ─── Snapshot generator ───────────────────────────────────────────────────────
 function captureSnapshot(streamKey) {
@@ -95,6 +84,28 @@ nms.on('postPublish', (id, args) => {
   if (!rawPath) return;
   const key = rawPath.replace('/live/', '');
   console.log(`[RTMP] Stream publicado: ${key}`);
+  
+  // Start manual HLS Transmuxing
+  const streamDir = path.join(MEDIA_ROOT, 'live', key);
+  fs.mkdirSync(streamDir, { recursive: true });
+  const hlsOut = path.join(streamDir, 'index.m3u8');
+  console.log(`[RTMP] Iniciando transcode HLS para ${key}`);
+  const rtmpUrl = `rtmp://127.0.0.1:55935/live/${key}`;
+  
+  const ffmpeg = execFile('ffmpeg', [
+    '-y', '-i', rtmpUrl,
+    '-c:v', 'copy',
+    '-c:a', 'copy',
+    '-f', 'hls',
+    '-hls_time', '2',
+    '-hls_list_size', '6',
+    '-hls_flags', 'delete_segments',
+    hlsOut
+  ], (err) => {
+    if (err && err.signal !== 'SIGKILL') console.error(`[HLS] erro ${key}:`, err.message);
+  });
+  hlsProcesses[key] = ffmpeg;
+
   // Snapshot after 5s (stream needs time to buffer)
   setTimeout(() => captureSnapshot(key), 5000);
 });
@@ -104,6 +115,12 @@ nms.on('donePublish', (id, args) => {
   if (!rawPath) return;
   const key = rawPath.replace('/live/', '');
   console.log(`[RTMP] Stream encerrado: ${key}`);
+  
+  if (hlsProcesses[key]) {
+    console.log(`[RTMP] Parando transcode HLS para ${key}`);
+    hlsProcesses[key].kill('SIGKILL');
+    delete hlsProcesses[key];
+  }
 });
 
 // ─── Minimal HTTP server for snapshots (CORS-safe) ──────────────────────────
