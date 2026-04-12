@@ -125,9 +125,25 @@ module.exports = {
       cwd: "$WORKER_DIR",
       interpreter: "none",
       autorestart: true,
-      max_restarts: 50,
+      max_restarts: 15,
+      max_memory_restart: "1500M",
+      restart_delay: 3000,
+      exp_backoff_restart_delay: 200,
+      min_uptime: "10s",
+      kill_signal: "SIGKILL",
+      kill_timeout: 5000,
+      merge_logs: true,
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
       watch: false,
-      env: { PYTHONUNBUFFERED: "1" }
+      env: { 
+        PYTHONUNBUFFERED: "1",
+        OMP_NUM_THREADS: "1",
+        OPENBLAS_NUM_THREADS: "1",
+        MKL_NUM_THREADS: "1",
+        VECLIB_MAXIMUM_THREADS: "1",
+        NUMEXPR_NUM_THREADS: "1",
+        DEMOGRAPHICS_ENGINE: "yolo"
+      }
     },
     {
       name: "viewsense-rtmp",
@@ -135,7 +151,13 @@ module.exports = {
       cwd: "$VIEWSENSE_DIR/scripts",
       interpreter: "node",
       autorestart: true,
-      max_restarts: 20,
+      max_restarts: 15,
+      max_memory_restart: "1500M",
+      restart_delay: 3000,
+      min_uptime: "10s",
+      kill_timeout: 8000,
+      merge_logs: true,
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
       watch: false,
       env: { NODE_ENV: "production" }
     }

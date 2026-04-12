@@ -110,7 +110,9 @@ class CameraDetector(threading.Thread):
         # State
         self.raw_rois: List[Dict] = []
         self.current_resolution: Optional[Tuple[int, int]] = None
-        self.roi_id = self.config.get('roi_id')
+        
+        # We no longer load a global camera roi_id from config (prevents stale ID ingestion blockages)
+        self.roi_id = None
 
         # Telemetry
         self.fps_monitor = sv.FPSMonitor()
@@ -121,12 +123,15 @@ class CameraDetector(threading.Thread):
         # Stream output
         self.latest_frame: Optional[np.ndarray] = None
         self.lock = threading.Lock()
+        self._ffmpeg_proc: Optional[subprocess.Popen] = None
+        self._reader_thread: Optional[threading.Thread] = None
+        self._capture_state: Optional[Dict[str, Any]] = None
 
         # Annotators
-        self.box_annotator = sv.BoxAnnotator()
-        self.trace_annotator = sv.TraceAnnotator()
+        self.box_annotator = sv.BoxAnnotator(thickness=1)
+        self.trace_annotator = sv.TraceAnnotator(thickness=1, trace_length=30)
         try:
-            self.label_annotator = sv.LabelAnnotator()
+            self.label_annotator = sv.LabelAnnotator(text_scale=0.4, text_thickness=1, text_padding=5)
         except AttributeError:
             self.label_annotator = None
 
@@ -198,6 +203,23 @@ class CameraDetector(threading.Thread):
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 bufsize=frame_bytes * 2)
 
+    def _terminate_ffmpeg(self):
+        proc = self._ffmpeg_proc
+        self._ffmpeg_proc = None
+        if not proc:
+            return
+
+        try:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+    def _clear_preview(self):
+        with self.lock:
+            self.latest_frame = None
+
 
     # ----- Main loop -----
 
@@ -223,12 +245,14 @@ class CameraDetector(threading.Thread):
         logger.info(f"📐 Stream resolution: {width}x{height}")
 
         proc = self._start_ffmpeg(width, height)
+        self._ffmpeg_proc = proc
         logger.info(f"✅ ffmpeg started for stream capture")
 
         dec_w = int(os.environ.get('DECODE_WIDTH', self.config.get('decode_width', 960)))
         dec_h = int(os.environ.get('DECODE_HEIGHT', self.config.get('decode_height', 540)))
         frame_size = dec_w * dec_h * 3
         shared_state = {"frame": None, "running": True, "error": False}
+        self._capture_state = shared_state
 
         def _reader_thread():
             try:
@@ -254,6 +278,7 @@ class CameraDetector(threading.Thread):
 
         thread = threading.Thread(target=_reader_thread, daemon=True)
         thread.start()
+        self._reader_thread = thread
 
         try:
             while self.running:
@@ -269,12 +294,16 @@ class CameraDetector(threading.Thread):
 
         finally:
             shared_state["running"] = False
-            proc.kill()
-            proc.wait()
+            self._terminate_ffmpeg()
+            if thread.is_alive():
+                thread.join(timeout=2)
+            self._reader_thread = None
+            self._capture_state = None
             is_mp4 = isinstance(self.source, str) and self.source.lower().split("?")[0].endswith(".mp4")
             delay = 0.1 if is_mp4 else 5
-            logger.info(f"ffmpeg terminated. Reconnecting in {delay}s...")
-            time.sleep(delay)
+            if self.running:
+                logger.info(f"ffmpeg terminated. Reconnecting in {delay}s...")
+                time.sleep(delay)
 
     def _run_cv2_capture(self):
         """Capture via OpenCV (local files, webcam)."""
@@ -355,10 +384,22 @@ class CameraDetector(threading.Thread):
             tracker_id = detections.tracker_id[i] if detections.tracker_id is not None else ""
             conf = detections.confidence[i]
             class_name = self.model.names.get(class_id, f"class_{class_id}")
-            lbl = f"{class_name} {conf:.2f}"
+            
+            lbl_parts = []
             if tracker_id:
-                lbl = f"#{tracker_id} {lbl}"
-            labels.append(lbl)
+                lbl_parts.append(f"#{tracker_id}")
+            lbl_parts.append(f"{class_name} {conf:.2f}")
+
+            # Inject Demographics dynamically!
+            if tracker_id and self.demographics:
+                demo_data = self.demographics.get_last_known(str(tracker_id))
+                if demo_data:
+                    # e.g., "[M/30]" instead of bucket
+                    gender_initial = "M" if demo_data.get("gender") == "male" else "F"
+                    age_val = demo_data.get("age_raw", "?")
+                    lbl_parts.append(f"[{gender_initial}/{age_val}]")
+            
+            labels.append(" ".join(lbl_parts))
 
         annotated = self.trace_annotator.annotate(scene=annotated, detections=detections)
         if getattr(self, "label_annotator", None):
@@ -550,6 +591,12 @@ class CameraDetector(threading.Thread):
 
     def stop(self):
         self.running = False
+        if self._capture_state:
+            self._capture_state["running"] = False
+        self._terminate_ffmpeg()
+        if self.is_alive() and threading.current_thread() is not self:
+            self.join(timeout=10)
+        self._clear_preview()
 
     def get_latest_frame(self):
         with self.lock:

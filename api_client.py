@@ -23,7 +23,8 @@ class APIClient:
 
         self.server_id = viewsense_conf.get('server_id', 'mac-local')
         self.server_secret = viewsense_conf.get('server_secret', '')
-        self.version = "1.0.0-mac"
+        self.version = "1.0.0-ubuntu"
+        self.public_media_base_url = viewsense_conf.get('public_media_base_url', '')
 
         self.ingest_url = viewsense_conf.get('api_url', '')
         self.heartbeat_url = viewsense_conf.get('heartbeat_url', '')
@@ -117,6 +118,7 @@ class APIClient:
         """
         rtmp_port = 55935
         hls_port = 8001
+        media_port = 8002
 
         # Possible install locations for rtmp-ingest.cjs
         RTMP_SCRIPT_PATHS = [
@@ -145,6 +147,7 @@ class APIClient:
             "rtmp_status": "running" if rtmp_running else "stopped",
             "rtmp_port": rtmp_port,
             "rtmp_hls_port": hls_port,
+            "rtmp_media_port": media_port,
         }
 
 
@@ -184,6 +187,9 @@ class APIClient:
             "cameras_active": self.active_cameras,
             "hostname": platform.node(),
             "version": self.version,
+            "config": {
+                "public_media_base_url": self.public_media_base_url or None,
+            },
             **rtmp_info,  # rtmp_status, rtmp_port, rtmp_hls_port
         }
 

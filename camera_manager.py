@@ -81,9 +81,10 @@ class CameraManager:
         logger.info(f"Started camera {cam_id}")
 
     def stop_camera(self, cam_id: str):
-        if cam_id in self.cameras:
-            self.cameras[cam_id].stop()
-            del self.cameras[cam_id]
+        detector = self.cameras.pop(cam_id, None)
+        if detector:
+            detector.stop()
+        self._watchdog_state.pop(cam_id, None)
 
     def restart_camera(self, cam_id: str):
         cam_conf = next((c for c in self.config['cameras'] if c['id'] == cam_id), None)
@@ -242,5 +243,4 @@ class CameraManager:
             self.stop_camera(cam_id)
         if self.api_client:
             await self.api_client.close()
-
 

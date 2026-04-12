@@ -28,10 +28,11 @@ const STREAMS_JSON = '/opt/viewsense/active_streams.json';
 
 // ─── Node-Media-Server (RTMP → HLS) ──────────────────────────────────────────
 const nmsConfig = {
+  logType: 1,
   rtmp: {
     port: 55935,
     chunk_size: 60000,
-    gop_cache: true,
+    gop_cache: false,
     ping: 30,
     ping_timeout: 60,
   },
