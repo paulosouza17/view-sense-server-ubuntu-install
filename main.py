@@ -9,11 +9,23 @@ Usage:
     # Status:       http://localhost:8765/status
 """
 import os
-# ── Thread limits: prevent PyTorch/OpenCV from using all CPU cores ──────────────
-os.environ["OMP_NUM_THREADS"] = "2"
-os.environ["MKL_NUM_THREADS"] = "2"
-os.environ["OPENBLAS_NUM_THREADS"] = "2"
-os.environ["NUMEXPR_NUM_THREADS"] = "2"
+import yaml
+
+# ── Thread limits: prevent PyTorch/OpenCV from freezing weak CPUs ──────────────
+max_threads = "2" # Default seguro
+try:
+    with open("config.yaml", "r") as f:
+        cfg = yaml.safe_load(f)
+        if cfg and "server" in cfg and "max_threads" in cfg["server"]:
+            max_threads = str(cfg["server"]["max_threads"])
+except Exception:
+    pass
+
+if max_threads.lower() != "auto":
+    os.environ["OMP_NUM_THREADS"] = max_threads
+    os.environ["MKL_NUM_THREADS"] = max_threads
+    os.environ["OPENBLAS_NUM_THREADS"] = max_threads
+    os.environ["NUMEXPR_NUM_THREADS"] = max_threads
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "timeout;10000"
 # ────────────────────────────────────────────────────────────────────────────────
 
@@ -25,12 +37,22 @@ import logging
 import asyncio
 import time
 import cv2
-cv2.setNumThreads(2)  # Limit OpenCV internal threads
+
+if max_threads.lower() != "auto":
+    try:
+        cv2.setNumThreads(int(max_threads))
+    except Exception:
+        pass
 
 try:
     import torch
-    torch.set_num_threads(2)  # Limit PyTorch/YOLO threads — prevents 200%+ CPU
-    torch.set_num_interop_threads(1)
+    if max_threads.lower() != "auto":
+        torch.set_num_threads(int(max_threads))
+        # torch.set_num_interop_threads only works if value > 0, so we wrap it
+        try:
+            torch.set_num_interop_threads(int(max_threads))
+        except RuntimeError:
+            pass
 except ImportError:
     pass
 
@@ -94,7 +116,15 @@ async def metrics():
     }
 
 
-def gen_frames(camera_id: str):
+import numpy as np
+
+# Create a global placeholder buffer once for offline cameras
+_placeholder_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+cv2.putText(_placeholder_img, "Stream Offline / Reconnecting...", (400, 360), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+_, _placeholder_buffer = cv2.imencode('.jpg', _placeholder_img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+_placeholder_bytes = _placeholder_buffer.tobytes()
+
+async def gen_frames(camera_id: str):
     detector = camera_manager.cameras.get(camera_id)
     if not detector:
         return
@@ -104,11 +134,22 @@ def gen_frames(camera_id: str):
             try:
                 ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
                 if ret:
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                    b_frame = buffer.tobytes()
+                else:
+                    b_frame = _placeholder_bytes
             except Exception as e:
                 logger.error(f"Frame encode error: {e}")
-        time.sleep(0.1)
+                b_frame = _placeholder_bytes
+        else:
+            b_frame = _placeholder_bytes
+
+        yield (b'--frame\r\n' +
+               b'Content-Type: image/jpeg\r\n' +
+               f'Content-Length: {len(b_frame)}\r\n\r\n'.encode() +
+               b_frame + b'\r\n')
+               
+        # Wait longer if offline to save bandwidth, else 20fps target
+        await asyncio.sleep(0.05 if frame is not None else 1.0)
 
 
 @app.get("/video/{camera_id}")

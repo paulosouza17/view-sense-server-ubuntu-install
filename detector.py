@@ -19,7 +19,7 @@ import os
 from api_client import APIClient
 from line_crossing import LineCrossingDetector, CountingLine
 from zone_monitor import ZoneMonitor
-from demographics import DemographicsAnalyzer
+from demographics import get_analyzer
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +105,7 @@ class CameraDetector(threading.Thread):
             demographics_enabled = False
         else: # 'true' or missing means we obey Supabase's config (which defaults to False)
             demographics_enabled = bool(self.config.get('demographics_enabled', False))
-        self.demographics = DemographicsAnalyzer(enabled=demographics_enabled)
+        self.demographics = get_analyzer(enabled=demographics_enabled)
 
         # State
         self.raw_rois: List[Dict] = []
@@ -159,7 +159,7 @@ class CameraDetector(threading.Thread):
         return 1280, 720
 
     def _start_ffmpeg(self, width: int, height: int):
-        target_fps = min(self.config.get('fps', 5), 5)  # Cap at 5 FPS — YOLO/CPU limit
+        target_fps = self.config.get('fps', 5)  # Respeita o limite real vindo do banco/config YAML sem hardcap
         # Decode resolution: env var > camera config > default 960x540
         dec_w = int(os.environ.get('DECODE_WIDTH', self.config.get('decode_width', 960)))
         dec_h = int(os.environ.get('DECODE_HEIGHT', self.config.get('decode_height', 540)))
@@ -484,7 +484,7 @@ class CameraDetector(threading.Thread):
                 "roi_id": evt["roi_id"],
                 "crossed_line": False,
                 "direction": None,
-                "dwell_time_seconds": evt["dwell_time"],
+                "dwell_time_seconds": int(evt["dwell_time"]),
             }
 
             # Attach demographics for dwell events (persons only)
